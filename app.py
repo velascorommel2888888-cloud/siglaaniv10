@@ -2,7 +2,7 @@
 SiglaAni — Flask Backend
 """
 
-import os, sqlite3, base64, hashlib
+import os, sqlite3, base64, hashlib, random
 from datetime import datetime
 import numpy as np
 import cv2
@@ -35,6 +35,9 @@ def add_header(response):
 # ── Password Hashing Helper ──────────────────────────────────────────────────
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+# In-memory store for active password reset verification codes
+PASSWORD_RESET_CODES = {}
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -92,6 +95,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('vendor', 'consumer')),
             full_name TEXT,
+            phone_number TEXT DEFAULT '',
             synced_kiosk_code TEXT DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -123,6 +127,12 @@ def init_db():
             conn.execute(f"ALTER TABLE inventory ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
+
+    # Ensure phone_number column exists in users table for existing databases
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN phone_number TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
 
     # Seed baseline inventory items if not already existing
     cur = conn.cursor()
@@ -290,9 +300,10 @@ def register():
     password = str(data.get('password', '')).strip()
     role = str(data.get('role', 'consumer')).strip().lower()
     full_name = str(data.get('full_name', '')).strip()
+    phone_number = str(data.get('phone_number', '')).strip()
 
-    if not username or not password:
-        return jsonify({'success': False, 'message': 'Username and password are required.'}), 400
+    if not username or not password or not phone_number:
+        return jsonify({'success': False, 'message': 'Username, password, and phone number are required.'}), 400
 
     if role not in ('vendor', 'consumer'):
         return jsonify({'success': False, 'message': 'Invalid account role.'}), 400
@@ -301,9 +312,9 @@ def register():
     cursor = conn.cursor()
     try:
         cursor.execute('''
-            INSERT INTO users (username, password_hash, role, full_name)
-            VALUES (?, ?, ?, ?)
-        ''', (username, hash_password(password), role, full_name or username))
+            INSERT INTO users (username, password_hash, role, full_name, phone_number)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (username, hash_password(password), role, full_name or username, phone_number))
         conn.commit()
         user_id = cursor.lastrowid
         return jsonify({
@@ -313,6 +324,7 @@ def register():
                 'username': username,
                 'role': role,
                 'full_name': full_name or username,
+                'phone_number': phone_number,
                 'synced_kiosk_code': None
             }
         }), 201
@@ -331,7 +343,7 @@ def login():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id, username, role, full_name, synced_kiosk_code FROM users
+        SELECT id, username, role, full_name, phone_number, synced_kiosk_code FROM users
         WHERE LOWER(username) = LOWER(?) AND password_hash = ? AND role = ?
     ''', (username, hash_password(password), role))
     row = cursor.fetchone()
@@ -347,9 +359,60 @@ def login():
             'username': row[1],
             'role': row[2],
             'full_name': row[3],
-            'synced_kiosk_code': row[4]
+            'phone_number': row[4],
+            'synced_kiosk_code': row[5]
         }
     }), 200
+
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, username, phone_number FROM users WHERE LOWER(username) = LOWER(?)', (username,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({'success': False, 'message': 'Username not found in records.'}), 404
+
+    reset_code = f"{random.randint(100000, 999999)}"
+    PASSWORD_RESET_CODES[username.lower()] = reset_code
+    phone_raw = row[2] or ""
+    masked_phone = f"******{phone_raw[-4:]}" if len(phone_raw) >= 4 else "your registered number"
+
+    # TODO: Integrate an SMS Gateway API here (e.g., Twilio, Semaphore) to dispatch `reset_code` to `phone_raw`
+
+    return jsonify({
+        'success': True,
+        'message': f'Verification code has been sent via SMS to {masked_phone}.',
+        'masked_phone': masked_phone
+    }), 200
+
+@app.route('/api/reset-password', methods=['POST'])
+def reset_password():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip().lower()
+    code = str(data.get('code', '')).strip()
+    new_password = str(data.get('new_password', '')).strip()
+
+    if username not in PASSWORD_RESET_CODES or PASSWORD_RESET_CODES[username] != code:
+        return jsonify({'success': False, 'message': 'Invalid or expired verification code.'}), 400
+
+    if not new_password:
+        return jsonify({'success': False, 'message': 'New password is required.'}), 400
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET password_hash = ? WHERE LOWER(username) = ?', (hash_password(new_password), username))
+    conn.commit()
+    conn.close()
+
+    del PASSWORD_RESET_CODES[username]
+
+    return jsonify({'success': True, 'message': 'Password has been successfully reset! You can now sign in.'}), 200
 
 # ── Kiosk Synchronization Routes ──────────────────────────────────────────────
 @app.route('/api/kiosk/sync', methods=['POST'])
@@ -372,7 +435,6 @@ def sync_kiosk():
         conn.close()
         return jsonify({'success': False, 'message': f'Kiosk code "{kiosk_code}" not recognized.'}), 404
 
-    # Enforce only one vendor per kiosk rule
     if kiosk[2] is not None and kiosk[2] != vendor_id:
         conn.close()
         return jsonify({
@@ -380,7 +442,6 @@ def sync_kiosk():
             'message': f'Kiosk {kiosk_code} is currently occupied by vendor "@{kiosk[3]}". Only one vendor can sync at a time.'
         }), 409
 
-    # Bind vendor to kiosk and update user record
     cursor.execute('UPDATE kiosks SET synced_vendor_id = ?, synced_vendor_username = ? WHERE kiosk_code = ?', (vendor_id, vendor_username, kiosk_code))
     cursor.execute('UPDATE users SET synced_kiosk_code = ? WHERE id = ?', (kiosk_code, vendor_id))
     conn.commit()
