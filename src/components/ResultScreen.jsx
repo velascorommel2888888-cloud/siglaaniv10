@@ -6,6 +6,7 @@ import {
   FaTrash, FaTimes 
 } from 'react-icons/fa';
 import { apiCheckout } from '../api';
+import '../styles/ResultScreen.css';
 
 const LIKERT = [
   { stars: 1, label: "Hindi Nakakain", color: "#ef5350" },
@@ -48,12 +49,12 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
   const [checkoutData, setCheckoutData] = useState(null);
   const [checkingOut, setCheckingOut] = useState(false);
 
-  // Weights state for weight-based calculation
+  // Dynamic pricing & weight input states
   const [weights, setWeights] = useState({});
   const [vendorRates, setVendorRates] = useState({});
 
   useEffect(() => {
-    fetch("http://localhost:5001/api/inventory")
+    fetch("http://127.0.0.1:5001/api/inventory")
       .then((res) => res.json())
       .then((data) => {
         if (Array.isArray(data)) {
@@ -124,7 +125,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
     window.__siglaani_cart__ = updatedCart;
   };
 
-  // Group same fruits in cart together for automatic quantity counting
+  // Group same fruits in cart together for automatic quantity calculation
   const groupedCart = useMemo(() => {
     const groups = {};
     cart.forEach((item) => {
@@ -153,61 +154,78 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
       const key = group.fruit_type.toLowerCase();
       const rate = vendorRates[key] || DEFAULT_RATES[key] || 100;
       const quantity = group.items.length;
-      const weightVal = parseFloat(weights[key]);
-      const hasWeight = !isNaN(weightVal) && weightVal > 0;
-      const effectiveWeight = hasWeight ? weightVal : quantity * 0.25;
-      const totalAmount = hasWeight ? Math.round(weightVal * rate) : Math.round(quantity * (rate * 0.25));
+      const rawWeight = weights[key];
+      const weightVal = parseFloat(rawWeight);
+      const hasValidWeight = !isNaN(weightVal) && weightVal > 0;
+      
+      const totalAmount = hasValidWeight ? Math.round(weightVal * rate) : null;
 
       return {
         ...group,
         key,
         rate,
         quantity,
+        hasValidWeight,
         totalAmount,
-        effectiveWeight
+        effectiveWeight: hasValidWeight ? weightVal : 0
       };
     });
   }, [groupedCart, vendorRates, weights]);
 
+  // All groups must have an entered weight > 0 before checkout is enabled
+  const isWeightValid = useMemo(() => {
+    if (calculatedGroups.length === 0) return false;
+    return calculatedGroups.every(g => g.hasValidWeight);
+  }, [calculatedGroups]);
+
   const grandTotal = useMemo(() => {
-    return calculatedGroups.reduce((sum, g) => sum + g.totalAmount, 0);
+    return calculatedGroups.reduce((sum, g) => sum + (g.totalAmount || 0), 0);
   }, [calculatedGroups]);
 
   const handleCheckout = async () => {
+    if (!isWeightValid || checkingOut) return;
+
     const itemsToCheckout = cart.length > 0 ? cart : resultsList;
-    const scanIds = itemsToCheckout.map(item => item.id || item.scan_id).filter(id => typeof id === "number");
+    const scanIds = itemsToCheckout
+      .map(item => item.id ?? item.scan_id ?? scanId)
+      .map(id => Number(id))
+      .filter(id => !isNaN(id) && id > 0);
+
     const fruitBreakdown = calculatedGroups.map(g => ({
       fruit_type: g.fruit_type,
       quantity: g.quantity,
       weight_kg: g.effectiveWeight,
       total_price: g.totalAmount
     }));
-    
+
     setCheckingOut(true);
     try {
-      if (scanIds.length > 0) {
-        const checkoutRes = await apiCheckout(scanIds, grandTotal, fruitBreakdown);
-        if (checkoutRes && checkoutRes.success) {
-          setCheckoutData(checkoutRes);
-          setCart([]);
-          window.__siglaani_cart__ = [];
-          setViewMode("receipt_qr");
-          return;
-        }
+      const checkoutRes = await apiCheckout({
+        scan_ids: scanIds,
+        total_amount: grandTotal,
+        fruit_breakdown: fruitBreakdown
+      });
+
+      if (checkoutRes && checkoutRes.success) {
+        setCheckoutData(checkoutRes);
+        setCart([]);
+        window.__siglaani_cart__ = [];
+        setViewMode("receipt_qr");
+        return;
       }
-      // Fallback local receipt
+    } catch (err) {
+      console.error("Checkout failed:", err);
       const ts = new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
       setCheckoutData({
         success: true,
         transaction_id: `TXN_${ts}`,
         qr_payload: `siglaani://receipt/TXN_${ts}`,
-        total_items: itemsToCheckout.length
+        total_items: itemsToCheckout.length,
+        total_amount: grandTotal
       });
       setCart([]);
       window.__siglaani_cart__ = [];
       setViewMode("receipt_qr");
-    } catch (err) {
-      console.error("Checkout failed:", err);
     } finally {
       setCheckingOut(false);
     }
@@ -217,7 +235,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
   const inspectQrTarget = `siglaani://inspection/${inspectScanId}`;
   const inspectQrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(inspectQrTarget)}`;
   
-  const receiptQrPayload = checkoutData?.qr_payload || `siglaani://receipt/${inspectQrTarget}`;
+  const receiptQrPayload = checkoutData?.qr_payload || (checkoutData?.transaction_id ? `siglaani://receipt/${checkoutData.transaction_id}` : `siglaani://receipt/TXN_DEMO`);
   const receiptQrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(receiptQrPayload)}`;
 
   const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -229,23 +247,11 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
           <LeafSVG />
           <div className="header-logo-text">SIGLA ANI</div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+        <div className="result-header-right">
           {cart.length > 0 && (
             <button 
+              className="cart-badge-btn"
               onClick={() => setViewMode("cart_view")}
-              style={{
-                background: "#7ee84a",
-                color: "#0b1f0d",
-                border: "none",
-                borderRadius: "20px",
-                padding: "4px 14px",
-                fontWeight: "800",
-                fontSize: "0.85rem",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                cursor: "pointer"
-              }}
             >
               <FaShoppingBag /> Cart ({cart.length})
             </button>
@@ -256,52 +262,43 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
         </div>
       </div>
 
-      <div className="result-body" style={{ flexDirection: "column", overflowY: "auto", padding: "16px" }}>
+      <div className="result-body">
         
-        {/* VIEW: CART MODAL (NEW DESIGN) */}
+        {/* VIEW: CART MODAL */}
         {viewMode === "cart_view" && (
-          <div className="result-hero" style={{ padding: "20px", maxWidth: "560px", margin: "auto", width: "100%", background: "#f7f4ec", borderRadius: "20px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", fontWeight: "800", fontSize: "1.2rem", color: "#0b1f0d" }}>
-                <FaShoppingBag color="#1a6630" /> Basket Items ({cart.length})
+          <div className="result-hero basket-modal-hero">
+            <div className="basket-modal-header">
+              <div className="basket-modal-title">
+                <FaShoppingBag className="basket-bag-icon" /> Basket Items ({cart.length})
               </div>
               <button 
                 onClick={() => setViewMode("details")}
-                style={{ background: "none", border: "none", fontSize: "1.2rem", color: "#666", cursor: "pointer" }}
+                className="basket-close-btn"
               >
                 <FaTimes />
               </button>
             </div>
 
             {cart.length === 0 ? (
-              <p style={{ textAlign: "center", color: "#666", padding: "20px 0" }}>Empty cart.</p>
+              <p className="basket-empty-text">Empty cart.</p>
             ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: "12px", maxHeight: "380px", overflowY: "auto", marginBottom: "16px", paddingRight: "4px" }}>
+              <div className="basket-list-container">
                 {calculatedGroups.map((group) => {
-                  const itemImg = group.image_url || (group.items[0]?.thumbnail ? `data:image/jpeg;base64;${group.items[0].thumbnail}` : null);
+                  const itemImg = group.image_url || (group.items[0]?.thumbnail ? `data:image/jpeg;base64,${group.items[0].thumbnail}` : null);
                   return (
-                    <div 
-                      key={group.key}
-                      style={{
-                        background: "#ffffff",
-                        padding: "16px",
-                        borderRadius: "16px",
-                        border: "1px solid #e5e7eb"
-                      }}
-                    >
-                      {/* Top Row: Image, Name, Price, and Trash Button */}
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
-                        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                    <div key={group.key} className="basket-item-card">
+                      <div className="basket-item-top">
+                        <div className="basket-item-info">
                           {itemImg && (
                             <img 
                               src={itemImg} 
                               alt={group.fruit_type} 
-                              style={{ width: "48px", height: "48px", objectFit: "cover", borderRadius: "10px", background: "#051307" }} 
+                              className="basket-item-thumb" 
                             />
                           )}
                           <div>
-                            <div style={{ fontWeight: "800", color: "#0b1f0d", fontSize: "1.05rem" }}>{group.fruit_type}</div>
-                            <div style={{ fontSize: "0.82rem", color: "#16a34a", fontWeight: "700" }}>
+                            <div className="basket-item-title">{group.fruit_type}</div>
+                            <div className="basket-item-rate">
                               ₱{group.rate} / kg
                             </div>
                           </div>
@@ -312,58 +309,59 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                             const ids = group.items.map(i => i.id || i.scan_id);
                             ids.forEach(id => handleRemoveFromCart(id));
                           }}
-                          style={{ background: "#fee2e2", border: "none", color: "#ef4444", borderRadius: "8px", width: "32px", height: "32px", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+                          className="basket-item-delete-btn"
                         >
                           <FaTrash size={12} />
                         </button>
                       </div>
 
-                      {/* 3 Metric Inputs: KG (weight) | Quantity | Total Amount */}
-                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" }}>
+                      {/* 3 Inputs Grid: KG (weight) | Quantity | Total Amount */}
+                      <div className="basket-inputs-grid">
                         <div>
-                          <label style={{ fontSize: "0.75rem", fontWeight: "700", color: "#64748b", display: "block", marginBottom: "4px" }}>
+                          <label className="basket-field-label">
                             KG (weight)
                           </label>
-                          <div style={{ display: "flex", alignItems: "center", background: "#fff", border: "1px solid #cbd5e1", borderRadius: "8px", padding: "4px 8px" }}>
+                          <div className="basket-input-wrap">
                             <input
                               type="text"
                               inputMode="decimal"
                               placeholder="e.g. 1.25"
                               value={weights[group.key] || ""}
                               onChange={(e) => handleWeightChange(group.key, e.target.value)}
-                              style={{ width: "100%", border: "none", outline: "none", fontSize: "0.9rem", fontWeight: "700", color: "#0f172a", background: "transparent" }}
+                              className="basket-input"
                             />
-                            <span style={{ fontSize: "0.75rem", color: "#94a3b8", fontWeight: "700", marginLeft: "4px" }}>kg</span>
+                            <span className="basket-unit">kg</span>
                           </div>
                         </div>
 
                         <div>
-                          <label style={{ fontSize: "0.75rem", fontWeight: "700", color: "#64748b", display: "block", marginBottom: "4px" }}>
+                          <label className="basket-field-label">
                             Quantity
                           </label>
-                          <div style={{ display: "flex", alignItems: "center", background: "#f8fafc", border: "1px solid #cbd5e1", borderRadius: "8px", padding: "4px 8px" }}>
+                          <div className="basket-input-wrap readonly">
                             <input
                               type="text"
                               readOnly
                               value={group.quantity}
-                              style={{ width: "100%", border: "none", outline: "none", fontSize: "0.9rem", fontWeight: "700", color: "#334155", background: "transparent" }}
+                              className="basket-input"
                             />
-                            <span style={{ fontSize: "0.75rem", color: "#94a3b8", fontWeight: "700", marginLeft: "4px" }}>pcs</span>
+                            <span className="basket-unit">pcs</span>
                           </div>
                         </div>
 
                         <div>
-                          <label style={{ fontSize: "0.75rem", fontWeight: "700", color: "#64748b", display: "block", marginBottom: "4px" }}>
+                          <label className="basket-field-label">
                             Total Amount
                           </label>
-                          <div style={{ display: "flex", alignItems: "center", background: "#f8fafc", border: "1px solid #cbd5e1", borderRadius: "8px", padding: "4px 8px" }}>
+                          <div className="basket-input-wrap readonly">
+                            <span className="basket-prefix">₱</span>
                             <input
                               type="text"
                               readOnly
-                              value={group.totalAmount}
-                              style={{ width: "100%", border: "none", outline: "none", fontSize: "0.9rem", fontWeight: "800", color: "#1a6630", background: "transparent" }}
+                              placeholder="e.g. 200"
+                              value={group.hasValidWeight ? group.totalAmount : ""}
+                              className={`basket-input ${group.hasValidWeight ? 'total-val' : 'total-placeholder'}`}
                             />
-                            <span style={{ fontSize: "0.75rem", color: "#94a3b8", fontWeight: "700", marginLeft: "4px" }}>₱</span>
                           </div>
                         </div>
                       </div>
@@ -373,43 +371,17 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: "10px" }}>
+            <div className="basket-actions-grid">
               <button 
                 onClick={() => setViewMode("details")}
-                style={{
-                  background: "#fff",
-                  border: "1px solid #cbd5e1",
-                  borderRadius: "12px",
-                  padding: "12px",
-                  fontWeight: "700",
-                  fontSize: "0.9rem",
-                  color: "#334155",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: "6px"
-                }}
+                className="basket-back-btn"
               >
                 ← Back to Slides
               </button>
               <button 
                 onClick={handleCheckout}
-                disabled={checkingOut || cart.length === 0}
-                style={{
-                  background: "#1a6630",
-                  border: "none",
-                  borderRadius: "12px",
-                  padding: "12px",
-                  color: "#fff",
-                  fontWeight: "800",
-                  fontSize: "0.9rem",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  gap: "6px"
-                }}
+                disabled={!isWeightValid || checkingOut || cart.length === 0}
+                className={`basket-checkout-btn ${(!isWeightValid || cart.length === 0) ? 'btn-disabled' : ''}`}
               >
                 <FaCheck /> {checkingOut ? "Checking out..." : `Checkout (${cart.length})`}
               </button>
@@ -419,56 +391,49 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
         {/* VIEW: INSPECTION QR SCREEN */}
         {viewMode === "inspect_qr" && (
-          <div className="result-hero" style={{ textAlign: "center", padding: "28px 24px", maxWidth: "480px", margin: "auto", width: "100%" }}>
-            <h2 style={{ fontSize: "1.5rem", fontWeight: "800", color: "#0b1f0d", marginBottom: "0.35rem" }}>
-              Scan QR for Receipt & History
+          <div className="result-hero qr-container-card">
+            <h2 className="qr-title">
+              Fruit Inspection QR
             </h2>
-            <p style={{ color: "#666", fontSize: "0.9rem", marginBottom: "1.5rem" }}>
-              Mayroong {resultsList.length} na-scan na prutas sa batch na ito.
+            <p className="qr-sub">
+              I-scan gamit ang mobile app para i-save ang inspection at freshness log ng {fruitName}.
             </p>
             
-            <div style={{ background: "#fff", padding: "14px", display: "inline-block", borderRadius: "18px", boxShadow: "0 6px 20px rgba(0,0,0,0.06)", marginBottom: "1.75rem" }}>
-              <img src={inspectQrUrl} alt="Inspection QR" style={{ width: "220px", height: "220px", display: "block" }} />
+            <div className="qr-wrapper-box">
+              <img src={inspectQrUrl} alt="Inspection QR" className="qr-img" />
             </div>
 
             <button 
-              className="scan-again-btn" 
+              className="scan-again-btn btn-inspect-full" 
               onClick={() => setViewMode("details")} 
-              style={{ width: "100%", background: "#0b1f0d", color: "#7ee84a", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", borderRadius: "24px", padding: "12px 0" }}
             >
               <FaList /> Inspect Slides ({resultsList.length} Fruits)
             </button>
           </div>
         )}
 
-        {/* VIEW: PURCHASED DIGITAL RECEIPT QR SCREEN */}
+        {/* VIEW: DIGITAL RECEIPT QR SCREEN */}
         {viewMode === "receipt_qr" && (
-          <div className="result-hero" style={{ textAlign: "center", padding: "28px 24px", maxWidth: "480px", margin: "auto", width: "100%" }}>
-            <div style={{ display: "flex", justifyContent: "center", marginBottom: "10px" }}>
-              <div style={{ background: "#7ee84a", borderRadius: "50%", width: "40px", height: "40px", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <FaCheck size={22} color="#0b1f0d" />
-              </div>
+          <div className="result-hero qr-container-card">
+            <div className="receipt-icon-circle">
+              <FaCheck size={22} color="#0b1f0d" />
             </div>
-            <h2 style={{ fontSize: "1.5rem", fontWeight: "800", color: "#0b1f0d", marginBottom: "0.25rem" }}>
+            <h2 className="qr-title">
               Digital Receipt Generated
             </h2>
-            <p style={{ color: "#666", fontSize: "0.9rem", marginBottom: "1.5rem" }}>
-              Batch Items: {checkoutData?.total_items || resultsList.length}
+            <p className="qr-sub">
+              Batch Items: {checkoutData?.total_items || resultsList.length} | Halaga: ₱{checkoutData?.total_amount || grandTotal || 0}
             </p>
             
-            <div style={{ background: "#fff", padding: "14px", display: "inline-block", borderRadius: "18px", boxShadow: "0 6px 20px rgba(0,0,0,0.06)", marginBottom: "1.25rem" }}>
-              <img src={receiptQrUrl} alt="Receipt QR" style={{ width: "220px", height: "220px", display: "block" }} />
+            <div className="qr-wrapper-box receipt-space">
+              <img src={receiptQrUrl} alt="Receipt QR" className="qr-img" />
             </div>
 
-            <div style={{ fontSize: "0.85rem", color: "#666", fontFamily: "monospace", marginBottom: "1.5rem" }}>
-              {receiptQrPayload}
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-              <button className="history-btn" onClick={onScanAgain} style={{ justifyContent: "center", display: "flex", gap: "6px" }}>
+            <div className="receipt-btns-grid">
+              <button className="history-btn receipt-btn-centered" onClick={onScanAgain}>
                 <FaUndo /> Scan More
               </button>
-              <button className="history-btn" onClick={onHome} style={{ justifyContent: "center", display: "flex", gap: "6px" }}>
+              <button className="history-btn receipt-btn-centered" onClick={onHome}>
                 <FaHome /> Home
               </button>
             </div>
@@ -477,25 +442,25 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
         {/* VIEW: MAIN DETAILS SCREEN */}
         {viewMode === "details" && (
-          <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "16px" }}>
+          <div className="details-view-container">
             {resultsList.length > 1 && (
-              <div className="result-hero" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", marginBottom: "0" }}>
+              <div className="result-hero slider-pagination-bar">
                 <button 
                   onClick={() => setCurrentIndex(prev => Math.max(0, prev - 1))}
                   disabled={currentIndex === 0}
-                  style={{ background: "none", border: "none", display: "flex", alignItems: "center", gap: "4px", fontSize: "14px", fontWeight: "bold", cursor: currentIndex === 0 ? "not-allowed" : "pointer", color: currentIndex === 0 ? "#bbb" : "#0b1f0d" }}
+                  className={`pagination-arrow-btn ${currentIndex === 0 ? 'disabled' : ''}`}
                 >
                   <FaChevronLeft /> Prev
                 </button>
 
-                <span style={{ fontWeight: "800", color: "#1a6630", fontSize: "0.95rem" }}>
+                <span className="pagination-text">
                   Fruit {currentIndex + 1} of {resultsList.length}
                 </span>
 
                 <button 
                   onClick={() => setCurrentIndex(prev => Math.min(resultsList.length - 1, prev + 1))}
                   disabled={currentIndex === resultsList.length - 1}
-                  style={{ background: "none", border: "none", display: "flex", alignItems: "center", gap: "4px", fontSize: "14px", fontWeight: "bold", cursor: currentIndex === resultsList.length - 1 ? "not-allowed" : "pointer", color: currentIndex === resultsList.length - 1 ? "#bbb" : "#0b1f0d" }}
+                  className={`pagination-arrow-btn ${currentIndex === resultsList.length - 1 ? 'disabled' : ''}`}
                 >
                   Next <FaChevronRight />
                 </button>
@@ -504,11 +469,11 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
             <div className="result-hero">
               {imageSource && (
-                <div style={{ width: "100%", height: "220px", borderRadius: "12px", overflow: "hidden", marginBottom: "16px", background: "#051307" }}>
+                <div className="res-hero-image-wrapper">
                   <img 
                     src={imageSource} 
                     alt={fruitName} 
-                    style={{ width: "100%", height: "100%", objectFit: "contain", display: "block" }} 
+                    className="res-hero-image" 
                   />
                 </div>
               )}
@@ -519,11 +484,11 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                     <h1 className="res-name">{fruitName}</h1>
                     <span className="res-sci">{scientificName}</span>
                   </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: "1.2rem", fontWeight: "800", color: "#1a6630" }}>
+                  <div className="res-price-col">
+                    <div className="res-price-val">
                       ₱{pricePerKg}
                     </div>
-                    <span style={{ fontSize: "0.75rem", color: "#666" }}>per kilo</span>
+                    <span className="res-price-unit">per kilo</span>
                   </div>
                 </div>
                 <StarRating rating={ratingVal} />
@@ -542,7 +507,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
               </div>
               <div className="res-meta-cell">
                 <div className="res-meta-label">Status</div>
-                <div className="res-meta-val" style={{ color: isRotten ? '#ef5350' : '#4ade80' }}>
+                <div className={`res-meta-val ${isRotten ? 'status-rotten' : 'status-fresh'}`}>
                   {statusLabel}
                 </div>
               </div>
@@ -552,39 +517,33 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
               </div>
             </div>
 
-            <div className="result-footer" style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "10px" }}>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
+            {/* ACTION CONTROLS */}
+            <div className="result-footer-custom">
+              {/* Row 1: Add to Cart (Left) and View QR (Right) */}
+              <div className="result-actions-row-top">
                 <button 
                   onClick={handleAddToCart}
                   disabled={isCurrentInCart || isRotten}
-                  className="history-btn"
-                  style={{ 
-                    background: isCurrentInCart ? "#e0f2fe" : "#f1f8e9", 
-                    color: isCurrentInCart ? "#0284c7" : "#1a6630", 
-                    fontWeight: "700", 
-                    display: "flex", 
-                    alignItems: "center", 
-                    justifyContent: "center", 
-                    gap: "6px" 
-                  }}
+                  className={`history-btn ${isCurrentInCart ? 'cart-btn-added' : 'cart-btn-unadded'}`}
                 >
                   <FaCartPlus /> {isCurrentInCart ? "Added to Cart" : "Add to Cart"}
                 </button>
 
                 <button 
-                  onClick={() => cart.length > 0 ? setViewMode("cart_view") : handleCheckout()}
-                  disabled={checkingOut}
-                  className="scan-again-btn"
-                  style={{ background: "#1a6630", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "6px" }}
+                  className="history-btn btn-view-qr-top" 
+                  onClick={() => setViewMode("inspect_qr")}
                 >
-                  <FaShoppingBag /> {checkingOut ? "Checking out..." : `Checkout (${cart.length})`}
+                  <FaQrcode /> View QR
                 </button>
               </div>
 
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" }}>
-                <button className="scan-again-btn" onClick={onScanAgain}>+ I-scan Muli</button>
-                <button className="history-btn" onClick={() => setViewMode("inspect_qr")} style={{ display: "flex", gap: "6px", alignItems: "center", justifyContent: "center" }}>
-                  <FaQrcode /> View QR
+              {/* Row 2: Centered full-width I-scan Muli button */}
+              <div>
+                <button 
+                  className="scan-again-btn btn-scan-again-centered" 
+                  onClick={onScanAgain}
+                >
+                  + I-scan Muli
                 </button>
               </div>
             </div>

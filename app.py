@@ -2,7 +2,7 @@
 SiglaAni — Flask Backend
 """
 
-import os, sqlite3, base64
+import os, sqlite3, base64, hashlib
 from datetime import datetime
 import numpy as np
 import cv2
@@ -31,6 +31,10 @@ def add_header(response):
     response.headers['Pragma']        = 'no-cache'
     response.headers['Expires']       = '-1'
     return response
+
+# ── Password Hashing Helper ──────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -80,7 +84,35 @@ def init_db():
         )
     """)
 
-    # Ensure all dynamic inventory columns exist
+    # Authentication & User Accounts Table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('vendor', 'consumer')),
+            full_name TEXT,
+            synced_kiosk_code TEXT DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Kiosks Table (Exclusive 1-to-1 sync enforcement)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kiosks (
+            kiosk_code TEXT PRIMARY KEY,
+            kiosk_name TEXT NOT NULL,
+            synced_vendor_id INTEGER DEFAULT NULL,
+            synced_vendor_username TEXT DEFAULT NULL,
+            FOREIGN KEY (synced_vendor_id) REFERENCES users(id)
+        )
+    """)
+
+    # Seed baseline kiosks
+    conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-01', 'Valenzuela Market Kiosk #1')")
+    conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-02', 'Valenzuela Market Kiosk #2')")
+
+    # Ensure dynamic inventory columns exist
     inv_cols = [
         ("price_per_kg",     "REAL DEFAULT 120.0"),
         ("supplier_name",    "TEXT DEFAULT 'Valenzuela Local Market'"),
@@ -245,12 +277,146 @@ def get_analysis_region(frame, bbox=None, padding=0.20):
             pass
     return frame.copy(), (0, 0, w, h)
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Core Endpoints ────────────────────────────────────────────────────────────
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "mode": "teachable_machine_priority"})
 
-# ── Phase 5: Vendor Inventory & Supplier Routes ──────────────────────────────
+# ── Authentication Routes ─────────────────────────────────────────────────────
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+    password = str(data.get('password', '')).strip()
+    role = str(data.get('role', 'consumer')).strip().lower()
+    full_name = str(data.get('full_name', '')).strip()
+
+    if not username or not password:
+        return jsonify({'success': False, 'message': 'Username and password are required.'}), 400
+
+    if role not in ('vendor', 'consumer'):
+        return jsonify({'success': False, 'message': 'Invalid account role.'}), 400
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO users (username, password_hash, role, full_name)
+            VALUES (?, ?, ?, ?)
+        ''', (username, hash_password(password), role, full_name or username))
+        conn.commit()
+        user_id = cursor.lastrowid
+        return jsonify({
+            'success': True,
+            'user': {
+                'id': user_id,
+                'username': username,
+                'role': role,
+                'full_name': full_name or username,
+                'synced_kiosk_code': None
+            }
+        }), 201
+    except sqlite3.IntegrityError:
+        return jsonify({'success': False, 'message': 'Username already exists.'}), 409
+    finally:
+        conn.close()
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get('username', '')).strip()
+    password = str(data.get('password', '')).strip()
+    role = str(data.get('role', 'consumer')).strip().lower()
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, username, role, full_name, synced_kiosk_code FROM users
+        WHERE LOWER(username) = LOWER(?) AND password_hash = ? AND role = ?
+    ''', (username, hash_password(password), role))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return jsonify({'success': False, 'message': 'Invalid credentials or wrong account role selected.'}), 401
+
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': row[0],
+            'username': row[1],
+            'role': row[2],
+            'full_name': row[3],
+            'synced_kiosk_code': row[4]
+        }
+    }), 200
+
+# ── Kiosk Synchronization Routes ──────────────────────────────────────────────
+@app.route('/api/kiosk/sync', methods=['POST'])
+def sync_kiosk():
+    data = request.get_json(silent=True) or {}
+    kiosk_code = str(data.get('kiosk_code', '')).strip().upper()
+    vendor_id = data.get('vendor_id')
+    vendor_username = str(data.get('username', '')).strip()
+
+    if not kiosk_code or not vendor_id:
+        return jsonify({'success': False, 'message': 'Kiosk code and Vendor ID are required.'}), 400
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT kiosk_code, kiosk_name, synced_vendor_id, synced_vendor_username FROM kiosks WHERE kiosk_code = ?', (kiosk_code,))
+    kiosk = cursor.fetchone()
+
+    if not kiosk:
+        conn.close()
+        return jsonify({'success': False, 'message': f'Kiosk code "{kiosk_code}" not recognized.'}), 404
+
+    # Enforce only one vendor per kiosk rule
+    if kiosk[2] is not None and kiosk[2] != vendor_id:
+        conn.close()
+        return jsonify({
+            'success': False,
+            'message': f'Kiosk {kiosk_code} is currently occupied by vendor "@{kiosk[3]}". Only one vendor can sync at a time.'
+        }), 409
+
+    # Bind vendor to kiosk and update user record
+    cursor.execute('UPDATE kiosks SET synced_vendor_id = ?, synced_vendor_username = ? WHERE kiosk_code = ?', (vendor_id, vendor_username, kiosk_code))
+    cursor.execute('UPDATE users SET synced_kiosk_code = ? WHERE id = ?', (kiosk_code, vendor_id))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        'success': True,
+        'message': f'Synced successfully with {kiosk[1]} ({kiosk_code}).',
+        'kiosk_code': kiosk_code,
+        'kiosk_name': kiosk[1]
+    }), 200
+
+@app.route('/api/kiosk/unsync', methods=['POST'])
+def unsync_kiosk():
+    data = request.get_json(silent=True) or {}
+    vendor_id = data.get('vendor_id')
+
+    if not vendor_id:
+        return jsonify({'success': False, 'message': 'Vendor ID is required.'}), 400
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    cursor = conn.cursor()
+    cursor.execute('SELECT synced_kiosk_code FROM users WHERE id = ?', (vendor_id,))
+    row = cursor.fetchone()
+    current_code = row[0] if row else None
+
+    if current_code:
+        cursor.execute('UPDATE kiosks SET synced_vendor_id = NULL, synced_vendor_username = NULL WHERE kiosk_code = ?', (current_code,))
+    
+    cursor.execute('UPDATE users SET synced_kiosk_code = NULL WHERE id = ?', (vendor_id,))
+    conn.commit()
+    conn.close()
+
+    return jsonify({'success': True, 'message': 'Successfully unsynced from kiosk.'}), 200
+
+# ── Inventory & Supplier Routes ───────────────────────────────────────────────
 @app.route("/api/inventory", methods=["GET"])
 def get_inventory():
     conn = sqlite3.connect(DB_PATH, timeout=15)
@@ -349,6 +515,7 @@ def delete_fruit_inventory(fruit_type):
     finally:
         conn.close()
 
+# ── Scan and Processing Endpoints ─────────────────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
 def scan():
     body = request.get_json(silent=True) or {}
@@ -362,7 +529,6 @@ def scan():
     except Exception as e:
         return jsonify({"error": "decode_failed", "message": str(e)}), 400
 
-    # Save the original full frame
     full_capture_filename = save_capture_image(frame)
 
     fruits_list = body.get("fruits") or []
@@ -445,53 +611,79 @@ def scan():
         "results":        analyzed_results
     }), 200
 
-# ── Phase 2: Batch Checkout Endpoint ──────────────────────────────────────────
+# ── Batch Checkout Endpoint ───────────────────────────────────────────────────
 @app.route("/api/checkout", methods=["POST"])
 def checkout():
     body = request.get_json(silent=True) or {}
-    scan_ids = body.get("scan_ids") or []
-    vendor_name = body.get("vendor_name", "Sigla Ani Kiosk - Valenzuela")
-
-    if not scan_ids:
-        return jsonify({"error": "no_items", "message": "Walang scan IDs na ibinigay para sa checkout."}), 400
+    if isinstance(body, list):
+        scan_ids = body
+        passed_total = None
+        fruit_breakdown = []
+        vendor_name = "Sigla Ani Kiosk - Valenzuela"
+    else:
+        scan_ids = body.get("scan_ids") or []
+        vendor_name = body.get("vendor_name", "Sigla Ani Kiosk - Valenzuela")
+        passed_total = body.get("total_amount")
+        fruit_breakdown = body.get("fruit_breakdown") or []
 
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
-        
-        placeholders = ",".join("?" for _ in scan_ids)
-        rows = cur.execute(f"SELECT * FROM scans WHERE id IN ({placeholders})", scan_ids).fetchall()
-        
-        if not rows:
-            return jsonify({"error": "not_found", "message": "Hindi nahanap ang mga na-scan na prutas."}), 404
-
-        total_amount = 0.0
-        for r in rows:
-            fruit_name = r["fruit"]
-            inv = cur.execute("SELECT unit_price, stock_count FROM inventory WHERE LOWER(fruit_type) = LOWER(?)", (fruit_name,)).fetchone()
-            price = inv["unit_price"] if inv else 20.0
-            total_amount += price
-
-            cur.execute("""
-                UPDATE inventory 
-                SET stock_count = MAX(0, stock_count - 1) 
-                WHERE LOWER(fruit_type) = LOWER(?)
-            """, (fruit_name,))
+        clean_ids = [int(x) for x in scan_ids if str(x).isdigit()]
+        rows = []
+        if clean_ids:
+            placeholders = ",".join("?" for _ in clean_ids)
+            rows = cur.execute(f"SELECT * FROM scans WHERE id IN ({placeholders})", clean_ids).fetchall()
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         transaction_id = f"TXN_{ts}"
 
+        # Deduct weight from inventory
+        if fruit_breakdown:
+            for item in fruit_breakdown:
+                f_type = str(item.get("fruit_type", "")).strip()
+                w_kg = float(item.get("weight_kg", 0.25))
+                cur.execute("""
+                    UPDATE inventory 
+                    SET stock_count = MAX(0, stock_count - ?) 
+                    WHERE LOWER(fruit_type) = LOWER(?)
+                """, (w_kg, f_type))
+            final_amount = float(passed_total) if passed_total is not None else 100.0
+        else:
+            final_amount = float(passed_total) if passed_total is not None else (len(rows) * 20.0 if rows else 25.0)
+
+        # Link scans to transaction
+        if clean_ids:
+            placeholders = ",".join("?" for _ in clean_ids)
+            cur.execute(f"""
+                UPDATE scans 
+                SET transaction_id = ?, is_purchased = 1 
+                WHERE id IN ({placeholders})
+            """, [transaction_id] + clean_ids)
+            total_items_count = len(clean_ids)
+        elif fruit_breakdown:
+            total_items_count = 0
+            for item in fruit_breakdown:
+                f_type = item.get("fruit_type", "Fruit")
+                qty = int(item.get("quantity", 1))
+                total_items_count += qty
+                for _ in range(qty):
+                    cur.execute("""
+                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased)
+                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1)
+                    """, (f_type, transaction_id))
+        else:
+            total_items_count = 1
+            cur.execute("""
+                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased)
+                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1)
+            """, (transaction_id,))
+
         cur.execute("""
             INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items)
             VALUES (?, ?, ?, ?)
-        """, (transaction_id, vendor_name, round(total_amount, 2), len(rows)))
-
-        cur.execute(f"""
-            UPDATE scans 
-            SET transaction_id = ?, is_purchased = 1 
-            WHERE id IN ({placeholders})
-        """, [transaction_id] + scan_ids)
+        """, (transaction_id, vendor_name, round(final_amount, 2), total_items_count))
 
         conn.commit()
 
@@ -499,9 +691,11 @@ def checkout():
             "success": True,
             "transaction_id": transaction_id,
             "qr_payload": f"siglaani://receipt/{transaction_id}",
-            "total_amount": round(total_amount, 2),
-            "total_items": len(rows)
+            "total_amount": round(final_amount, 2),
+            "total_items": total_items_count
         }), 200
+    except Exception as e:
+        return jsonify({"error": "checkout_failed", "message": str(e)}), 500
     finally:
         conn.close()
 
