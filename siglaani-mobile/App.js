@@ -19,10 +19,12 @@ import { Feather, Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BASE_URL } from './config';
 import { vendorStyles, COLORS, styles as baseStyles } from './styles';
+import LoginScreen from './LoginScreen';
 
 const STORAGE_RECEIPTS_KEY = '@siglaani_receipts';
 const STORAGE_INSPECTIONS_KEY = '@siglaani_inspections';
 const STORAGE_STOCK_LOGS_KEY = '@siglaani_stock_logs';
+const STORAGE_AUTH_USER_KEY = '@siglaani_auth_user';
 
 function getShelfLifeInfo(conditionLabel, purchasedAt) {
   const label = (conditionLabel || '').toLowerCase();
@@ -89,10 +91,12 @@ export default function App() {
 }
 
 function MainApp() {
-  const [role, setRole] = useState('vendor'); // 'vendor' or 'consumer'
-  const [vendorNavTab, setVendorNavTab] = useState('inventory'); // 'dashboard', 'inventory', 'sales', 'profile'
-  const [consumerTab, setConsumerTab] = useState('receipts'); // 'receipts' or 'inspections'
-  const [consumerScreen, setConsumerScreen] = useState('basket'); // 'basket' or 'scanner'
+  const [currentUser, setCurrentUser] = useState(null);
+
+  const [role, setRole] = useState('vendor');
+  const [vendorNavTab, setVendorNavTab] = useState('inventory');
+  const [consumerTab, setConsumerTab] = useState('receipts');
+  const [consumerScreen, setConsumerScreen] = useState('basket');
 
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
@@ -102,7 +106,7 @@ function MainApp() {
   const [expandedTxn, setExpandedTxn] = useState(null);
 
   // Inventory States
-  const [activeFilter, setActiveFilter] = useState('All'); // 'All', 'Available', 'Out of Stock'
+  const [activeFilter, setActiveFilter] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [inventoryList, setInventoryList] = useState([]);
   const [loadingInv, setLoadingInv] = useState(false);
@@ -118,6 +122,11 @@ function MainApp() {
   const [stockLogsMap, setStockLogsMap] = useState({});
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
 
+  // Kiosk Sync States
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [kioskCodeInput, setKioskCodeInput] = useState('');
+  const [syncingKiosk, setSyncingKiosk] = useState(false);
+
   // Analytics & Sales States
   const [serverHistory, setServerHistory] = useState([]);
   const [salesList, setSalesList] = useState([]);
@@ -130,24 +139,36 @@ function MainApp() {
   const [newSupplierName, setNewSupplierName] = useState('');
 
   useEffect(() => {
-    loadLocalData();
+    (async () => {
+      try {
+        const userJson = await AsyncStorage.getItem(STORAGE_AUTH_USER_KEY);
+        if (userJson) {
+          const parsed = JSON.parse(userJson);
+          setCurrentUser(parsed);
+          setRole(parsed.role || 'vendor');
+        }
+
+        const recJson = await AsyncStorage.getItem(STORAGE_RECEIPTS_KEY);
+        const inspJson = await AsyncStorage.getItem(STORAGE_INSPECTIONS_KEY);
+        const logsJson = await AsyncStorage.getItem(STORAGE_STOCK_LOGS_KEY);
+
+        if (recJson) {
+          const parsedRec = JSON.parse(recJson);
+          setReceipts(parsedRec);
+          checkFruitSpoilageOnLaunch(parsedRec);
+        }
+        if (inspJson) setInspections(JSON.parse(inspJson));
+        if (logsJson) setStockLogsMap(JSON.parse(logsJson));
+      } catch (e) {
+        console.warn('Failed to load local data:', e);
+      }
+    })();
   }, []);
 
-  const loadLocalData = async () => {
-    try {
-      const recJson = await AsyncStorage.getItem(STORAGE_RECEIPTS_KEY);
-      const inspJson = await AsyncStorage.getItem(STORAGE_INSPECTIONS_KEY);
-      const logsJson = await AsyncStorage.getItem(STORAGE_STOCK_LOGS_KEY);
-      if (recJson) {
-        const parsed = JSON.parse(recJson);
-        setReceipts(parsed);
-        checkFruitSpoilageOnLaunch(parsed);
-      }
-      if (inspJson) setInspections(JSON.parse(inspJson));
-      if (logsJson) setStockLogsMap(JSON.parse(logsJson));
-    } catch (e) {
-      console.warn('Failed to load local data:', e);
-    }
+  const handleLogout = async () => {
+    await AsyncStorage.removeItem(STORAGE_AUTH_USER_KEY);
+    setCurrentUser(null);
+    setSelectedFruit(null);
   };
 
   const fetchVendorInventory = useCallback(async () => {
@@ -186,11 +207,11 @@ function MainApp() {
   }, []);
 
   useEffect(() => {
-    if (role === 'vendor') {
+    if (currentUser && role === 'vendor') {
       fetchVendorInventory();
       fetchAnalyticsAndSales();
     }
-  }, [role, fetchVendorInventory, fetchAnalyticsAndSales]);
+  }, [currentUser, role, fetchVendorInventory, fetchAnalyticsAndSales]);
 
   const filteredInventory = useMemo(() => {
     return inventoryList.filter((item) => {
@@ -299,7 +320,7 @@ function MainApp() {
     const newLog = {
       date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
       type: isAdd ? 'delivery' : 'adjustment',
-      label: isAdd ? 'Stock added (New delivery)' : 'Stock adjusted (Manual)',
+      label: isAdd ? 'Stock added (New delivery)' : 'Stock adjusted',
       weight: isAdd ? qty : -qty,
       isGreen: isAdd
     };
@@ -313,7 +334,7 @@ function MainApp() {
     await AsyncStorage.setItem(STORAGE_STOCK_LOGS_KEY, JSON.stringify(updatedLogsMap));
 
     setAdjustmentQty('');
-    Alert.alert('Applied', `Stock successfully adjusted!`);
+    Alert.alert('Applied', 'Stock successfully adjusted!');
   };
 
   const handleClearFruitStockHistory = async () => {
@@ -452,6 +473,76 @@ function MainApp() {
     }
   };
 
+  const handleSyncWithKiosk = async () => {
+    const code = kioskCodeInput.trim().toUpperCase();
+    if (!code) {
+      Alert.alert('Missing Code', 'Please enter a Kiosk code (e.g. KSK-VAL-01).');
+      return;
+    }
+
+    setSyncingKiosk(true);
+    try {
+      const res = await fetch(`${BASE_URL}/api/kiosk/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          kiosk_code: code,
+          vendor_id: currentUser.id,
+          username: currentUser.username
+        })
+      });
+
+      const resJson = await res.json();
+      if (!res.ok || !resJson.success) {
+        Alert.alert('Sync Blocked', resJson.message || 'Failed to sync with this kiosk.');
+        return;
+      }
+
+      const updatedUser = { ...currentUser, synced_kiosk_code: resJson.kiosk_code };
+      setCurrentUser(updatedUser);
+      await AsyncStorage.setItem(STORAGE_AUTH_USER_KEY, JSON.stringify(updatedUser));
+      setIsSyncModalOpen(false);
+      setKioskCodeInput('');
+      Alert.alert('Kiosk Paired', resJson.message);
+    } catch (err) {
+      Alert.alert('Sync Error', 'Could not reach server.');
+    } finally {
+      setSyncingKiosk(false);
+    }
+  };
+
+  const handleUnsyncKiosk = () => {
+    Alert.alert(
+      'Unsync Kiosk?',
+      `Are you sure you want to disconnect from ${currentUser?.synced_kiosk_code}? Another vendor will then be able to claim it.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Unsync',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const res = await fetch(`${BASE_URL}/api/kiosk/unsync`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vendor_id: currentUser.id })
+              });
+
+              if (res.ok) {
+                const updatedUser = { ...currentUser, synced_kiosk_code: null };
+                setCurrentUser(updatedUser);
+                await AsyncStorage.setItem(STORAGE_AUTH_USER_KEY, JSON.stringify(updatedUser));
+                Alert.alert('Unpaired', 'Kiosk has been released.');
+              }
+            } catch (err) {
+              Alert.alert('Error', 'Could not reach server.');
+            }
+          }
+        }
+      ]
+    );
+  };
+
   const handleBarcodeScanned = async ({ data }) => {
     if (scanned || loading) return;
     setScanned(true);
@@ -535,7 +626,6 @@ function MainApp() {
     );
   };
 
-  // Analytics
   const totalScans = serverHistory.length;
   const fruitCounts = {};
   let ripeCount = 0;
@@ -551,6 +641,17 @@ function MainApp() {
     if (count > maxCount) { maxCount = count; topFruit = fruit; }
   });
   const freshnessRate = totalScans > 0 ? Math.round((ripeCount / totalScans) * 100) : 0;
+
+  if (!currentUser) {
+    return (
+      <LoginScreen
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+          setRole(user.role);
+        }}
+      />
+    );
+  }
 
   return (
     <SafeAreaView style={vendorStyles.container} edges={['top', 'left', 'right']}>
@@ -570,13 +671,10 @@ function MainApp() {
 
         <TouchableOpacity
           style={vendorStyles.roleBadgeBtn}
-          onPress={() => {
-            setSelectedFruit(null);
-            setRole(prev => (prev === 'vendor' ? 'consumer' : 'vendor'));
-          }}
+          onPress={handleLogout}
         >
           <Text style={vendorStyles.roleBadgeBtnText}>
-            {role === 'vendor' ? 'Vendor Mode ▾' : 'Consumer Mode ▾'}
+            Sign Out ⇥
           </Text>
         </TouchableOpacity>
       </View>
@@ -946,7 +1044,7 @@ function MainApp() {
               </View>
             )}
 
-            {/* TAB 3: SALES (Clear History placed cleanly at the bottom) */}
+            {/* TAB 3: SALES */}
             {vendorNavTab === 'sales' && (
               <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
                 <Text style={vendorStyles.pageHeading}>Sales History</Text>
@@ -999,11 +1097,40 @@ function MainApp() {
                 <Text style={vendorStyles.pageHeading}>Vendor Profile</Text>
                 <Text style={vendorStyles.pageSubheading}>Store settings and kiosk connection.</Text>
 
+                {/* Kiosk Pairing Card */}
+                <View style={vendorStyles.sectionCard}>
+                  <Text style={vendorStyles.sectionCardTitle}>Kiosk Station Pairing</Text>
+                  <View style={vendorStyles.statusItemRow}>
+                    <Text style={vendorStyles.statusItemLabel}>Status:</Text>
+                    <Text style={[vendorStyles.statusItemVal, { color: currentUser?.synced_kiosk_code ? '#16A34A' : '#DC2626' }]}>
+                      {currentUser?.synced_kiosk_code ? `Synced to ${currentUser.synced_kiosk_code}` : 'No Kiosk Paired'}
+                    </Text>
+                  </View>
+
+                  {currentUser?.synced_kiosk_code ? (
+                    <TouchableOpacity
+                      style={[vendorStyles.clearHistoryBtn, { marginTop: 10, marginBottom: 4 }]}
+                      onPress={handleUnsyncKiosk}
+                    >
+                      <Feather name="link-2" size={14} color="#DC2626" />
+                      <Text style={vendorStyles.clearHistoryBtnText}>Unsync from Kiosk</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity
+                      style={[vendorStyles.applyStockAdjustmentBtn, { height: 42, marginTop: 10 }]}
+                      onPress={() => setIsSyncModalOpen(true)}
+                    >
+                      <Feather name="radio" size={15} color="#FFFFFF" />
+                      <Text style={vendorStyles.applyStockAdjustmentBtnText}>Sync with a Kiosk</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+
                 <View style={vendorStyles.sectionCard}>
                   <Text style={vendorStyles.sectionCardTitle}>Store Information</Text>
                   <View style={vendorStyles.statusItemRow}>
                     <Text style={vendorStyles.statusItemLabel}>Store Name:</Text>
-                    <Text style={vendorStyles.statusItemVal}>Sigla Ani Kiosk - Valenzuela</Text>
+                    <Text style={vendorStyles.statusItemVal}>{currentUser?.full_name || 'Sigla Ani Kiosk'}</Text>
                   </View>
                   <View style={vendorStyles.statusItemRow}>
                     <Text style={vendorStyles.statusItemLabel}>Location:</Text>
@@ -1026,11 +1153,11 @@ function MainApp() {
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={vendorStyles.profileOptionRow}
-                    onPress={() => setRole('consumer')}
+                    onPress={handleLogout}
                   >
                     <View style={vendorStyles.profileOptionLeft}>
-                      <Feather name="smartphone" size={15} color="#1E293B" />
-                      <Text style={vendorStyles.profileOptionText}>Switch to Consumer Basket</Text>
+                      <Feather name="log-out" size={15} color="#DC2626" />
+                      <Text style={[vendorStyles.profileOptionText, { color: '#DC2626' }]}>Sign Out / Switch Account</Text>
                     </View>
                     <Feather name="chevron-right" size={16} color="#CBD5E1" />
                   </TouchableOpacity>
@@ -1117,7 +1244,7 @@ function MainApp() {
           </View>
         )
       ) : (
-        /* ── CONSUMER MODE (WHITE BASE, GREEN HEADER, SPOILAGE ALERT) ── */
+        /* ── CONSUMER MODE ── */
         <View style={{ flex: 1, backgroundColor: '#F8FAF8' }}>
           <View style={baseStyles.navTabs}>
             <TouchableOpacity
@@ -1248,7 +1375,6 @@ function MainApp() {
             )}
           </ScrollView>
 
-          {/* Original Camera Scan Floating Button */}
           <TouchableOpacity
             style={{ position: 'absolute', bottom: 20, right: 20, backgroundColor: '#1E5E3A', width: 60, height: 60, borderRadius: 30, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.3, shadowRadius: 4 }}
             onPress={() => setConsumerScreen(prev => (prev === 'scanner' ? 'basket' : 'scanner'))}
@@ -1257,6 +1383,41 @@ function MainApp() {
           </TouchableOpacity>
         </View>
       )}
+
+      {/* ── SYNC WITH KIOSK MODAL ── */}
+      <Modal visible={isSyncModalOpen} transparent animationType="slide" onRequestClose={() => setIsSyncModalOpen(false)}>
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', padding: 20 }}>
+          <View style={{ backgroundColor: '#fff', borderRadius: 16, padding: 20 }}>
+            <Text style={{ fontSize: 18, fontWeight: '800', color: '#0F172A', marginBottom: 4 }}>Sync with a Kiosk</Text>
+            <Text style={{ fontSize: 12, color: '#64748B', marginBottom: 14 }}>
+              Enter the unique code displayed on the physical kiosk monitor (e.g. KSK-VAL-01).
+            </Text>
+
+            <Text style={vendorStyles.fieldLabelSmall}>Kiosk Station Code</Text>
+            <TextInput
+              style={[vendorStyles.modalTextInput, { textTransform: 'uppercase' }]}
+              placeholder="KSK-VAL-01"
+              placeholderTextColor="#94A3B8"
+              autoCapitalize="characters"
+              value={kioskCodeInput}
+              onChangeText={setKioskCodeInput}
+            />
+
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 6 }}>
+              <TouchableOpacity style={[vendorStyles.cancelBtn, { height: 44 }]} onPress={() => setIsSyncModalOpen(false)}>
+                <Text style={vendorStyles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[vendorStyles.saveChangesBtn, { height: 44 }]} onPress={handleSyncWithKiosk} disabled={syncingKiosk}>
+                {syncingKiosk ? (
+                  <ActivityIndicator size="small" color="#FFFFFF" />
+                ) : (
+                  <Text style={vendorStyles.saveChangesBtnText}>Claim & Sync</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       {/* ── STOCK HISTORY "VIEW ALL" MODAL ── */}
       <Modal visible={isHistoryModalOpen} transparent animationType="slide" onRequestClose={() => setIsHistoryModalOpen(false)}>

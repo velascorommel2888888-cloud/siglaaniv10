@@ -156,7 +156,7 @@ export const vendorStyles = StyleSheet.create({
   pageSubheading: {
     fontSize: 13,
     color: '#64748B',
-    marginBottom: 4,
+    marginBottom: 12,
   },
   searchAndAddRow: {
     flexDirection: 'row',
