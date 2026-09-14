@@ -162,6 +162,21 @@ export const loginStyles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '800',
   },
+  forgotPasswordText: {
+    color: '#1E5E3A',
+    fontSize: 12,
+    fontWeight: '700',
+    textAlign: 'right',
+    marginTop: -8,
+    marginBottom: 14,
+  },
+  backToLoginText: {
+    color: '#64748B',
+    fontSize: 12,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 12,
+  },
   footerHint: {
     fontSize: 12,
     color: '#94A3B8',
