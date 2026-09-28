@@ -2,7 +2,7 @@
 SiglaAni — Flask Backend
 """
 
-import os, sqlite3, base64, hashlib, random
+import os, sqlite3, base64, hashlib, random, threading, time, urllib.request, json
 from datetime import datetime
 import numpy as np
 import cv2
@@ -22,6 +22,9 @@ XAI_MIN_CONFIDENCE = 60
 XAI_MIN_COVERAGE   = 0.015
 XAI_MAX_COVERAGE   = 0.85
 
+# Optional Cloud Sync Endpoint (Replace with your actual hosted endpoint or Supabase Edge function)
+CLOUD_SYNC_URL = os.environ.get("SIGLAANI_CLOUD_URL", "")
+
 app = Flask(__name__)
 CORS(app)
 
@@ -38,6 +41,72 @@ def hash_password(password: str) -> str:
 
 # In-memory store for active password reset verification codes
 PASSWORD_RESET_CODES = {}
+
+# ── Metadata & Recommendations ────────────────────────────────────────────────
+CONDITION_LABELS = {
+    "ripe":     "Hinog (Ripe)",
+    "overripe": "Sobrang Hinog (Overripe)",
+    "unripe":   "Hindi Pa Hinog (Unripe)",
+    "rotten":   "Bulok (Rotten)",
+}
+
+RECOMMENDATIONS = {
+    "ripe":     "Ang prutas ay nasa tamang kondisyon para sa pagkain. Maaari na itong kainin ngayon o ilagay sa ref sa loob ng 3–5 araw.",
+    "overripe": "Ang prutas ay medyo sobrang hinog na. Angkop pa rin para sa pagluluto o smoothie. Gamitin kaagad sa loob ng 1–2 araw.",
+    "unripe":   "Ang prutas ay hindi pa ganap na hinog. Ilagay sa maaliwalas na lugar. Magiging handa ito sa loob ng 2–4 araw.",
+    "rotten":   "Ang prutas ay hindi na ligtas kainin. Itapon na ito agad para maiwasan ang kontaminasyon.",
+}
+
+# Supported fruits and scientific names
+FRUIT_METADATA = {
+    "banana":     ("Banana",     "Musa acuminata"),
+    "apple":      ("Apple",      "Malus domestica"),
+    "orange":     ("Orange",     "Citrus sinensis"),
+    "mango":      ("Mango",      "Mangifera indica"),
+    "strawberry": ("Strawberry", "Fragaria × ananassa"),
+}
+
+def parse_model_label(raw_label: str):
+    """
+    Parses Teachable Machine class labels (e.g. 'fresh_ripe_banana', 'unripe_mango', 'background_empty').
+    Returns: (fruit_display_name, scientific_name, condition_key, is_background)
+    """
+    lbl = str(raw_label or "").strip().lower()
+
+    if not lbl or "background" in lbl or "empty" in lbl:
+        return None, None, None, True
+
+    # Identify Fruit
+    fruit_name = "Fruit"
+    sci_name = "SIGLA ANI AI"
+    for key, (display_name, scientific) in FRUIT_METADATA.items():
+        if key in lbl:
+            fruit_name = display_name
+            sci_name = scientific
+            break
+
+    # Identify Condition
+    if "overripe" in lbl:
+        condition = "overripe"
+    elif "unripe" in lbl:
+        condition = "unripe"
+    elif "rotten" in lbl:
+        condition = "rotten"
+    elif "ripe" in lbl or "fresh" in lbl:
+        condition = "ripe"
+    else:
+        condition = "ripe"
+
+    return fruit_name, sci_name, condition, False
+
+def condition_to_rating(condition: str, confidence: int) -> int:
+    if condition == "ripe":
+        return 5 if confidence >= 85 else 4
+    if condition == "overripe":
+        return 2
+    if condition == "unripe":
+        return 3
+    return 1
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db():
@@ -61,7 +130,8 @@ def init_db():
             xai_explanation  TEXT   DEFAULT '',
             xai_generated    INTEGER DEFAULT 0,
             transaction_id   TEXT    DEFAULT NULL,
-            is_purchased     INTEGER DEFAULT 0
+            is_purchased     INTEGER DEFAULT 0,
+            synced           INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -70,11 +140,11 @@ def init_db():
             vendor_name      TEXT DEFAULT 'Sigla Ani Kiosk - Valenzuela',
             total_amount     REAL DEFAULT 0.0,
             total_items      INTEGER DEFAULT 0,
-            purchased_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            purchased_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            synced           INTEGER DEFAULT 0
         )
     """)
     
-    # Phase 2 & 5: Inventory Control Table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +157,6 @@ def init_db():
         )
     """)
 
-    # Authentication & User Accounts Table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +170,6 @@ def init_db():
         )
     """)
 
-    # Kiosks Table (Exclusive 1-to-1 sync enforcement)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS kiosks (
             kiosk_code TEXT PRIMARY KEY,
@@ -112,11 +180,9 @@ def init_db():
         )
     """)
 
-    # Seed baseline kiosks
     conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-01', 'Valenzuela Market Kiosk #1')")
     conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-02', 'Valenzuela Market Kiosk #2')")
 
-    # Ensure dynamic inventory columns exist
     inv_cols = [
         ("price_per_kg",     "REAL DEFAULT 120.0"),
         ("supplier_name",    "TEXT DEFAULT 'Valenzuela Local Market'"),
@@ -128,17 +194,20 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-    # Ensure phone_number column exists in users table for existing databases
     try:
         conn.execute("ALTER TABLE users ADD COLUMN phone_number TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
 
-    # Seed baseline inventory items if not already existing
+    # Baseline seed inventory with Mango and Strawberry included
     cur = conn.cursor()
-    for item in [("Apple", 50, 25.0, 140.0, "Valenzuela Local Market", "0917-123-4567"), 
-                 ("Banana", 80, 15.0, 75.0, "Bulacan Fruit Hub", "0918-987-6543"), 
-                 ("Orange", 40, 20.0, 120.0, "Divisoria Wholesale", "0922-555-7890")]:
+    for item in [
+        ("Apple",      50, 25.0, 140.0, "Valenzuela Local Market", "0917-123-4567"), 
+        ("Banana",     80, 15.0, 75.0,  "Bulacan Fruit Hub",       "0918-987-6543"), 
+        ("Orange",     40, 20.0, 120.0, "Divisoria Wholesale",     "0922-555-7890"),
+        ("Mango",      40, 30.0, 160.0, "Local Market",            "0919-333-1122"),
+        ("Strawberry", 25, 45.0, 350.0, "Baguio Farm Hub",         "0917-444-5566")
+    ]:
         cur.execute("""
             INSERT OR IGNORE INTO inventory (fruit_type, stock_count, unit_price, price_per_kg, supplier_name, supplier_contact)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -151,13 +220,20 @@ def init_db():
         ("xai_explanation",  "TEXT DEFAULT ''"),
         ("xai_generated",    "INTEGER DEFAULT 0"),
         ("transaction_id",   "TEXT DEFAULT NULL"),
-        ("is_purchased",     "INTEGER DEFAULT 0")
+        ("is_purchased",     "INTEGER DEFAULT 0"),
+        ("synced",           "INTEGER DEFAULT 0")
     ]
     for col, decl in new_cols:
         try:
             conn.execute(f"ALTER TABLE scans ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
+
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN synced INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -170,8 +246,8 @@ def save_scan(data: dict) -> int:
               (fruit, scientific, condition, condition_label,
                confidence, rating, recommendation, temp, thumbnail,
                capture_filename, xai_filename, xai_coverage,
-               xai_explanation, xai_generated, transaction_id, is_purchased)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               xai_explanation, xai_generated, transaction_id, is_purchased, synced)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
         """, (
             str(data.get("fruit",            "Unknown")),
             str(data.get("scientific",       "SIGLA ANI AI")),
@@ -206,6 +282,58 @@ def get_history(limit=50):
     finally:
         conn.close()
 
+# ── Background Store-and-Forward Sync Worker ─────────────────────────────────
+def check_internet(timeout=3):
+    """Checks if external internet is reachable."""
+    try:
+        urllib.request.urlopen("https://1.1.1.1", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+def sync_worker_loop():
+    """Background worker that syncs offline transactions & scans when internet is restored."""
+    while True:
+        time.sleep(15)
+        if not CLOUD_SYNC_URL or not check_internet():
+            continue
+
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=15)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            unsynced_txns = cur.execute("SELECT * FROM transactions WHERE synced = 0 LIMIT 25").fetchall()
+            unsynced_scans = cur.execute("SELECT * FROM scans WHERE synced = 0 AND is_purchased = 1 LIMIT 50").fetchall()
+
+            if not unsynced_txns and not unsynced_scans:
+                conn.close()
+                continue
+
+            payload = {
+                "transactions": [dict(t) for t in unsynced_txns],
+                "scans": [dict(s) for s in unsynced_scans]
+            }
+
+            req = urllib.request.Request(
+                CLOUD_SYNC_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    txn_ids = [t["transaction_id"] for t in unsynced_txns]
+                    scan_ids = [s["id"] for s in unsynced_scans]
+
+                    if txn_ids:
+                        cur.execute(f"UPDATE transactions SET synced = 1 WHERE transaction_id IN ({','.join(['?']*len(txn_ids))})", txn_ids)
+                    if scan_ids:
+                        cur.execute(f"UPDATE scans SET synced = 1 WHERE id IN ({','.join(['?']*len(scan_ids))})", scan_ids)
+                    conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
 # ── Image helpers ─────────────────────────────────────────────────────────────
 def decode_image(b64_string: str):
     if "," in b64_string:
@@ -237,37 +365,6 @@ def save_crop_image(crop_frame, prefix="crop") -> str:
     filepath = os.path.join(CAPTURE_DIR, filename)
     cv2.imwrite(filepath, crop_frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return filename
-
-# ── Metadata ──────────────────────────────────────────────────────────────────
-CONDITION_LABELS = {
-    "ripe":     "Hinog (Ripe)",
-    "overripe": "Sobrang Hinog (Overripe)",
-    "unripe":   "Hindi Pa Hinog (Unripe)",
-    "rotten":   "Bulok (Rotten)",
-}
-
-RECOMMENDATIONS = {
-    "ripe":     "Ang prutas ay nasa tamang kondisyon para sa pagkain. Maaari na itong kainin ngayon o ilagay sa ref sa loob ng 5–7 araw.",
-    "overripe": "Ang prutas ay medyo sobrang hinog na. Angkop pa rin para sa pagluluto o smoothie. Gamitin kaagad sa loob ng 1–2 araw.",
-    "unripe":   "Ang prutas ay hindi pa ganap na hinog. Ilagay sa maaliwalas na lugar. Magiging handa ito sa loob ng 2–4 araw.",
-    "rotten":   "Ang prutas ay hindi na ligtas kainin. Itapon na ito agad para maiwasan ang kontaminasyon.",
-}
-
-FRUIT_METADATA = {
-    "banana":  ("Banana", "Musa acuminata"),
-    "saging":  ("Banana", "Musa acuminata"),
-    "apple":   ("Apple",  "Malus domestica"),
-    "orange":  ("Orange", "Citrus sinensis"),
-}
-
-def condition_to_rating(condition: str, confidence: int) -> int:
-    if condition == "ripe":
-        return 5 if confidence >= 85 else 4
-    if condition == "overripe":
-        return 2
-    if condition == "unripe":
-        return 3
-    return 1
 
 def get_analysis_region(frame, bbox=None, padding=0.20):
     h, w = frame.shape[:2]
@@ -382,8 +479,6 @@ def forgot_password():
     PASSWORD_RESET_CODES[username.lower()] = reset_code
     phone_raw = row[2] or ""
     masked_phone = f"******{phone_raw[-4:]}" if len(phone_raw) >= 4 else "your registered number"
-
-    # TODO: Integrate an SMS Gateway API here (e.g., Twilio, Semaphore) to dispatch `reset_code` to `phone_raw`
 
     return jsonify({
         'success': True,
@@ -610,19 +705,16 @@ def scan():
     try:
         cur = conn.cursor()
         for idx, item in enumerate(fruits_list):
-            raw_name = str(item.get("detected_fruit") or "").strip().lower()
-            if raw_name in FRUIT_METADATA:
-                fruit_display, sci = FRUIT_METADATA[raw_name]
-            elif raw_name:
-                fruit_display = raw_name.capitalize()
-                sci = "SIGLA ANI AI"
-            else:
-                fruit_display = "Fruit"
-                sci = "SIGLA ANI AI"
+            raw_label = str(item.get("detected_fruit") or "").strip()
+            
+            fruit_display, sci, parsed_condition, is_bg = parse_model_label(raw_label)
 
-            condition = str(item.get("model_condition") or "ripe").lower()
-            if condition not in CONDITION_LABELS:
-                condition = "ripe"
+            # Skip background or empty tray detections
+            if is_bg:
+                continue
+
+            passed_condition = str(item.get("model_condition") or "").strip().lower()
+            condition = passed_condition if passed_condition in CONDITION_LABELS else parsed_condition
 
             confidence = int(item.get("model_confidence") or 85)
             bbox = item.get("bbox")
@@ -637,10 +729,10 @@ def scan():
                 "fruit":            fruit_display,
                 "scientific":       sci,
                 "condition":        condition,
-                "conditionLabel":   CONDITION_LABELS[condition],
+                "conditionLabel":   CONDITION_LABELS.get(condition, "Hinog (Ripe)"),
                 "confidence":       confidence,
                 "rating":           condition_to_rating(condition, confidence),
-                "recommendation":   RECOMMENDATIONS[condition],
+                "recommendation":   RECOMMENDATIONS.get(condition, RECOMMENDATIONS["ripe"]),
                 "temp":             0.0,
                 "price_per_kg":     price_per_kg,
                 "thumbnail":        make_thumbnail(crop),
@@ -657,9 +749,17 @@ def scan():
             result_item["scan_id"] = new_id
             analyzed_results.append(result_item)
 
+        if not analyzed_results:
+            return jsonify({
+                "success": False,
+                "message": "Walang prutas na nakita sa inspection tray.",
+                "total_count": 0,
+                "results": []
+            }), 200
+
         cur.execute("""
-            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items, synced)
+            VALUES (?, ?, ?, ?, 0)
         """, (transaction_id, "Sigla Ani Kiosk - Valenzuela", len(analyzed_results) * 20.0, len(analyzed_results)))
         conn.commit()
     finally:
@@ -700,7 +800,6 @@ def checkout():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         transaction_id = f"TXN_{ts}"
 
-        # Deduct weight from inventory
         if fruit_breakdown:
             for item in fruit_breakdown:
                 f_type = str(item.get("fruit_type", "")).strip()
@@ -714,12 +813,11 @@ def checkout():
         else:
             final_amount = float(passed_total) if passed_total is not None else (len(rows) * 20.0 if rows else 25.0)
 
-        # Link scans to transaction
         if clean_ids:
             placeholders = ",".join("?" for _ in clean_ids)
             cur.execute(f"""
                 UPDATE scans 
-                SET transaction_id = ?, is_purchased = 1 
+                SET transaction_id = ?, is_purchased = 1, synced = 0 
                 WHERE id IN ({placeholders})
             """, [transaction_id] + clean_ids)
             total_items_count = len(clean_ids)
@@ -731,19 +829,19 @@ def checkout():
                 total_items_count += qty
                 for _ in range(qty):
                     cur.execute("""
-                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased)
-                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1)
+                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced)
+                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0)
                     """, (f_type, transaction_id))
         else:
             total_items_count = 1
             cur.execute("""
-                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased)
-                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1)
+                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced)
+                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0)
             """, (transaction_id,))
 
         cur.execute("""
-            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items, synced)
+            VALUES (?, ?, ?, ?, 0)
         """, (transaction_id, vendor_name, round(final_amount, 2), total_items_count))
 
         conn.commit()
@@ -847,4 +945,6 @@ def clear():
 
 if __name__ == "__main__":
     init_db()
+    # Start background store-and-forward sync thread
+    threading.Thread(target=sync_worker_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=True)

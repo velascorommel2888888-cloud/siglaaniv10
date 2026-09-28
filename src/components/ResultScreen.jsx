@@ -3,10 +3,14 @@ import LeafSVG from './shared/LeafSVG';
 import { 
   FaUndo, FaHome, FaChevronLeft, FaChevronRight, 
   FaQrcode, FaList, FaCartPlus, FaCheck, FaShoppingBag, 
-  FaTrash, FaTimes 
+  FaTrash, FaTimes, FaTag, FaExclamationTriangle
 } from 'react-icons/fa';
 import { apiCheckout } from '../api';
+import WeightModal from './WeightModal';
+import SyncStatusBadge from './SyncStatusBadge';
 import '../styles/ResultScreen.css';
+
+const CONFIDENCE_THRESHOLD = 65; // Below 65% is treated as Unrecognized Fruit
 
 const LIKERT = [
   { stars: 1, label: "Hindi Nakakain", color: "#ef5350" },
@@ -20,6 +24,8 @@ const DEFAULT_RATES = {
   apple: 140,
   banana: 75,
   orange: 120,
+  mango: 160,
+  strawberry: 350
 };
 
 function StarRating({ rating = 3 }) {
@@ -49,9 +55,21 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
   const [checkoutData, setCheckoutData] = useState(null);
   const [checkingOut, setCheckingOut] = useState(false);
 
-  // Dynamic pricing & weight input states
+  // Pricing, weight, and tawad (discount) states
   const [weights, setWeights] = useState({});
   const [vendorRates, setVendorRates] = useState({});
+  const [tawadDiscount, setTawadDiscount] = useState("");
+
+  // Numpad Modal State (Used for both Weight and Tawad)
+  const [numpadModal, setNumpadModal] = useState({
+    isOpen: false,
+    mode: "weight", // "weight" or "currency"
+    title: "",
+    subtitle: "",
+    fruit: "",
+    pricePerKg: 100,
+    groupKey: null
+  });
 
   useEffect(() => {
     fetch("http://127.0.0.1:5001/api/inventory")
@@ -79,15 +97,20 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
   const res = resultsList[currentIndex] || resultsList[0] || {};
   
-  const fruitName = res.fruit || res.fruit_type || "";
-  const scientificName = res.scientific || "";
-  const isRotten = res.condition === "rotten" || (res.conditionLabel && res.conditionLabel.toLowerCase().includes("bulok"));
-  const statusLabel = res.conditionLabel || res.status || (isRotten ? "Bulok (Rotten)" : "Hinog (Ripe)");
+  const rawFruitName = res.fruit || res.fruit_type || "Fruit";
   const confidenceVal = res.confidence != null ? Math.round(res.confidence) : 0;
-  const ratingVal = res.rating ?? (isRotten ? 1 : 4);
-  const recoText = res.recommendation || "";
+  
+  const isUnrecognized = confidenceVal < CONFIDENCE_THRESHOLD || rawFruitName.toLowerCase() === "unknown";
+  const fruitName = isUnrecognized ? "Hindi Kilalang Prutas" : rawFruitName;
+  const scientificName = isUnrecognized ? "Not in dataset" : (res.scientific || "");
+  
+  const isRotten = !isUnrecognized && (res.condition === "rotten" || (res.conditionLabel && res.conditionLabel.toLowerCase().includes("bulok")));
+  const statusLabel = isUnrecognized ? "Unrecognized" : (res.conditionLabel || res.status || (isRotten ? "Bulok (Rotten)" : "Hinog (Ripe)"));
+  const ratingVal = isUnrecognized ? 1 : (res.rating ?? (isRotten ? 1 : 4));
+  const recoText = isUnrecognized 
+    ? "Ang prutas na ito ay wala pa sa dataset ng system. Siguraduhing ito ay kabilang sa mga suportadong prutas (Apple, Banana, Orange, Mango, Strawberry)." 
+    : (res.recommendation || "");
 
-  // Dynamic price per kilo display
   const pricePerKg = vendorRates[fruitName.toLowerCase()] || res.price_per_kg || DEFAULT_RATES[fruitName.toLowerCase()] || 100;
 
   let imageSource = null;
@@ -104,19 +127,18 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
   const currentScanId = res.id || res.scan_id || `item_${currentIndex}`;
   const isCurrentInCart = cart.some(item => (item.id || item.scan_id) === currentScanId);
 
-  const handleAddToCart = () => {
-    if (!isCurrentInCart) {
-      const itemToStaging = {
-        ...res,
-        id: currentScanId,
-        scan_id: currentScanId,
-        resolvedImage: imageSource,
-        price_per_kg: pricePerKg
-      };
-      const updatedCart = [...cart, itemToStaging];
-      setCart(updatedCart);
-      window.__siglaani_cart__ = updatedCart;
-    }
+  const handleAddToCartDirect = () => {
+    if (isCurrentInCart || isRotten || isUnrecognized) return;
+    const itemToStaging = {
+      ...res,
+      id: currentScanId,
+      scan_id: currentScanId,
+      resolvedImage: imageSource,
+      price_per_kg: pricePerKg
+    };
+    const updatedCart = [...cart, itemToStaging];
+    setCart(updatedCart);
+    window.__siglaani_cart__ = updatedCart;
   };
 
   const handleRemoveFromCart = (idToRemove) => {
@@ -125,7 +147,6 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
     window.__siglaani_cart__ = updatedCart;
   };
 
-  // Group same fruits in cart together for automatic quantity calculation
   const groupedCart = useMemo(() => {
     const groups = {};
     cart.forEach((item) => {
@@ -143,10 +164,43 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
     return Object.values(groups);
   }, [cart]);
 
-  const handleWeightChange = (key, val) => {
-    if (/^\d*\.?\d*$/.test(val)) {
-      setWeights((prev) => ({ ...prev, [key]: val }));
+  // Open Numpad for Fruit Weight
+  const handleOpenWeightNumpad = (group) => {
+    setNumpadModal({
+      isOpen: true,
+      mode: "weight",
+      title: "Ilagay ang Timbang",
+      subtitle: `${group.fruit_type} • ₱${group.rate} / kg`,
+      fruit: group.fruit_type,
+      pricePerKg: group.rate,
+      groupKey: group.key
+    });
+  };
+
+  // Open Numpad for Tawad / Discount
+  const handleOpenTawadNumpad = () => {
+    setNumpadModal({
+      isOpen: true,
+      mode: "currency",
+      title: "Tawad / Bawas (₱)",
+      subtitle: "Ilagay ang halaga ng diskwento sa kabuuang bayarin",
+      fruit: "",
+      pricePerKg: 0,
+      groupKey: null
+    });
+  };
+
+  // Confirm values from the Numpad
+  const handleConfirmNumpad = (enteredValue) => {
+    if (numpadModal.mode === "weight" && numpadModal.groupKey) {
+      setWeights((prev) => ({
+        ...prev,
+        [numpadModal.groupKey]: enteredValue.toString()
+      }));
+    } else if (numpadModal.mode === "currency") {
+      setTawadDiscount(enteredValue > 0 ? enteredValue.toString() : "");
     }
+    setNumpadModal(prev => ({ ...prev, isOpen: false }));
   };
 
   const calculatedGroups = useMemo(() => {
@@ -172,15 +226,20 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
     });
   }, [groupedCart, vendorRates, weights]);
 
-  // All groups must have an entered weight > 0 before checkout is enabled
   const isWeightValid = useMemo(() => {
     if (calculatedGroups.length === 0) return false;
     return calculatedGroups.every(g => g.hasValidWeight);
   }, [calculatedGroups]);
 
-  const grandTotal = useMemo(() => {
+  const subtotalAmount = useMemo(() => {
     return calculatedGroups.reduce((sum, g) => sum + (g.totalAmount || 0), 0);
   }, [calculatedGroups]);
+
+  const discountVal = parseFloat(tawadDiscount) || 0;
+
+  const grandTotal = useMemo(() => {
+    return Math.max(0, subtotalAmount - discountVal);
+  }, [subtotalAmount, discountVal]);
 
   const handleCheckout = async () => {
     if (!isWeightValid || checkingOut) return;
@@ -203,13 +262,15 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
       const checkoutRes = await apiCheckout({
         scan_ids: scanIds,
         total_amount: grandTotal,
-        fruit_breakdown: fruitBreakdown
+        fruit_breakdown: fruitBreakdown,
+        discount_tawad: discountVal
       });
 
       if (checkoutRes && checkoutRes.success) {
         setCheckoutData(checkoutRes);
         setCart([]);
         window.__siglaani_cart__ = [];
+        setTawadDiscount("");
         setViewMode("receipt_qr");
         return;
       }
@@ -225,6 +286,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
       });
       setCart([]);
       window.__siglaani_cart__ = [];
+      setTawadDiscount("");
       setViewMode("receipt_qr");
     } finally {
       setCheckingOut(false);
@@ -248,6 +310,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
           <div className="header-logo-text">SIGLA ANI</div>
         </div>
         <div className="result-header-right">
+          <SyncStatusBadge />
           {cart.length > 0 && (
             <button 
               className="cart-badge-btn"
@@ -256,7 +319,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
               <FaShoppingBag /> Cart ({cart.length})
             </button>
           )}
-          <div className={`result-badge badge-${isRotten ? 'rotten' : 'ripe'}`}>
+          <div className={`result-badge badge-${isUnrecognized ? 'rotten' : (isRotten ? 'rotten' : 'ripe')}`}>
             {statusLabel}
           </div>
         </div>
@@ -264,7 +327,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
       <div className="result-body">
         
-        {/* VIEW: CART MODAL */}
+        {/* VIEW: CART / BASKET VIEW */}
         {viewMode === "cart_view" && (
           <div className="result-hero basket-modal-hero">
             <div className="basket-modal-header">
@@ -282,93 +345,157 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
             {cart.length === 0 ? (
               <p className="basket-empty-text">Empty cart.</p>
             ) : (
-              <div className="basket-list-container">
-                {calculatedGroups.map((group) => {
-                  const itemImg = group.image_url || (group.items[0]?.thumbnail ? `data:image/jpeg;base64,${group.items[0].thumbnail}` : null);
-                  return (
-                    <div key={group.key} className="basket-item-card">
-                      <div className="basket-item-top">
-                        <div className="basket-item-info">
-                          {itemImg && (
-                            <img 
-                              src={itemImg} 
-                              alt={group.fruit_type} 
-                              className="basket-item-thumb" 
-                            />
-                          )}
+              <>
+                <div className="basket-list-container">
+                  {calculatedGroups.map((group) => {
+                    const itemImg = group.image_url || (group.items[0]?.thumbnail ? `data:image/jpeg;base64,${group.items[0].thumbnail}` : null);
+                    return (
+                      <div key={group.key} className="basket-item-card">
+                        <div className="basket-item-top">
+                          <div className="basket-item-info">
+                            {itemImg && (
+                              <img 
+                                src={itemImg} 
+                                alt={group.fruit_type} 
+                                className="basket-item-thumb" 
+                              />
+                            )}
+                            <div>
+                              <div className="basket-item-title">{group.fruit_type}</div>
+                              <div className="basket-item-rate">
+                                ₱{group.rate} / kg
+                              </div>
+                            </div>
+                          </div>
+
+                          <button 
+                            onClick={() => {
+                              const ids = group.items.map(i => i.id || i.scan_id);
+                              ids.forEach(id => handleRemoveFromCart(id));
+                            }}
+                            className="basket-item-delete-btn"
+                          >
+                            <FaTrash size={12} />
+                          </button>
+                        </div>
+
+                        {/* 3 Inputs Grid: KG | Quantity | Total Amount */}
+                        <div className="basket-inputs-grid">
                           <div>
-                            <div className="basket-item-title">{group.fruit_type}</div>
-                            <div className="basket-item-rate">
-                              ₱{group.rate} / kg
+                            <label className="basket-field-label">
+                              KG (weight)
+                            </label>
+                            <div 
+                              className="basket-input-wrap"
+                              onClick={() => handleOpenWeightNumpad(group)}
+                              style={{ cursor: 'pointer' }}
+                            >
+                              <input
+                                type="text"
+                                readOnly
+                                placeholder="Tap to weigh"
+                                value={weights[group.key] || ""}
+                                className="basket-input"
+                                style={{ cursor: 'pointer' }}
+                              />
+                              <span className="basket-unit">kg</span>
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="basket-field-label">
+                              Quantity
+                            </label>
+                            <div className="basket-input-wrap readonly">
+                              <input
+                                type="text"
+                                readOnly
+                                value={group.quantity}
+                                className="basket-input"
+                              />
+                              <span className="basket-unit">pcs</span>
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="basket-field-label">
+                              Total Amount
+                            </label>
+                            <div className="basket-input-wrap readonly">
+                              <span className="basket-prefix">₱</span>
+                              <input
+                                type="text"
+                                readOnly
+                                placeholder="e.g. 200"
+                                value={group.hasValidWeight ? group.totalAmount : ""}
+                                className={`basket-input ${group.hasValidWeight ? 'total-val' : 'total-placeholder'}`}
+                              />
                             </div>
                           </div>
                         </div>
-
-                        <button 
-                          onClick={() => {
-                            const ids = group.items.map(i => i.id || i.scan_id);
-                            ids.forEach(id => handleRemoveFromCart(id));
-                          }}
-                          className="basket-item-delete-btn"
-                        >
-                          <FaTrash size={12} />
-                        </button>
                       </div>
+                    );
+                  })}
+                </div>
 
-                      {/* 3 Inputs Grid: KG (weight) | Quantity | Total Amount */}
-                      <div className="basket-inputs-grid">
-                        <div>
-                          <label className="basket-field-label">
-                            KG (weight)
-                          </label>
-                          <div className="basket-input-wrap">
-                            <input
-                              type="text"
-                              inputMode="decimal"
-                              placeholder="e.g. 1.25"
-                              value={weights[group.key] || ""}
-                              onChange={(e) => handleWeightChange(group.key, e.target.value)}
-                              className="basket-input"
-                            />
-                            <span className="basket-unit">kg</span>
-                          </div>
-                        </div>
-
-                        <div>
-                          <label className="basket-field-label">
-                            Quantity
-                          </label>
-                          <div className="basket-input-wrap readonly">
-                            <input
-                              type="text"
-                              readOnly
-                              value={group.quantity}
-                              className="basket-input"
-                            />
-                            <span className="basket-unit">pcs</span>
-                          </div>
-                        </div>
-
-                        <div>
-                          <label className="basket-field-label">
-                            Total Amount
-                          </label>
-                          <div className="basket-input-wrap readonly">
-                            <span className="basket-prefix">₱</span>
-                            <input
-                              type="text"
-                              readOnly
-                              placeholder="e.g. 200"
-                              value={group.hasValidWeight ? group.totalAmount : ""}
-                              className={`basket-input ${group.hasValidWeight ? 'total-val' : 'total-placeholder'}`}
-                            />
-                          </div>
-                        </div>
-                      </div>
+                {/* TAWAD / DISCOUNT SECTION (Tappable for Numpad) */}
+                <div 
+                  onClick={handleOpenTawadNumpad}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    background: '#F8FAFC',
+                    border: '1px solid #CBD5E1',
+                    borderRadius: '12px',
+                    padding: '12px 16px',
+                    marginTop: '12px',
+                    marginBottom: '12px',
+                    cursor: 'pointer'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <FaTag color="#16A34A" />
+                    <div>
+                      <div style={{ fontSize: '13px', fontWeight: '700', color: '#1E293B' }}>Tawad / Discount (₱)</div>
+                      <div style={{ fontSize: '11px', color: '#64748B' }}>I-tap para maglagay ng bawas</div>
                     </div>
-                  );
-                })}
-              </div>
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontWeight: '700', color: discountVal > 0 ? '#16A34A' : '#94A3B8' }}>- ₱</span>
+                    <div style={{
+                      minWidth: '70px',
+                      padding: '6px 12px',
+                      backgroundColor: '#FFFFFF',
+                      border: '1px solid #CBD5E1',
+                      borderRadius: '8px',
+                      textAlign: 'right',
+                      fontWeight: '800',
+                      fontSize: '15px',
+                      color: discountVal > 0 ? '#16A34A' : '#94A3B8'
+                    }}>
+                      {discountVal > 0 ? discountVal.toFixed(2) : "0.00"}
+                    </div>
+                  </div>
+                </div>
+
+                {/* SUMMARY BREAKDOWN */}
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '0 4px',
+                  marginBottom: '10px'
+                }}>
+                  <span style={{ fontSize: '13px', color: '#64748B' }}>
+                    Subtotal: ₱{subtotalAmount} {discountVal > 0 && `(-₱${discountVal})`}
+                  </span>
+                  <span style={{ fontSize: '18px', fontWeight: '800', color: '#16A34A' }}>
+                    Total: ₱{grandTotal}
+                  </span>
+                </div>
+              </>
             )}
 
             <div className="basket-actions-grid">
@@ -383,7 +510,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                 disabled={!isWeightValid || checkingOut || cart.length === 0}
                 className={`basket-checkout-btn ${(!isWeightValid || cart.length === 0) ? 'btn-disabled' : ''}`}
               >
-                <FaCheck /> {checkingOut ? "Checking out..." : `Checkout (${cart.length})`}
+                <FaCheck /> {checkingOut ? "Checking out..." : `Checkout ₱${grandTotal}`}
               </button>
             </div>
           </div>
@@ -392,17 +519,13 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
         {/* VIEW: INSPECTION QR SCREEN */}
         {viewMode === "inspect_qr" && (
           <div className="result-hero qr-container-card">
-            <h2 className="qr-title">
-              Fruit Inspection QR
-            </h2>
+            <h2 className="qr-title">Fruit Inspection QR</h2>
             <p className="qr-sub">
               I-scan gamit ang mobile app para i-save ang inspection at freshness log ng {fruitName}.
             </p>
-            
             <div className="qr-wrapper-box">
               <img src={inspectQrUrl} alt="Inspection QR" className="qr-img" />
             </div>
-
             <button 
               className="scan-again-btn btn-inspect-full" 
               onClick={() => setViewMode("details")} 
@@ -418,17 +541,13 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
             <div className="receipt-icon-circle">
               <FaCheck size={22} color="#0b1f0d" />
             </div>
-            <h2 className="qr-title">
-              Digital Receipt Generated
-            </h2>
+            <h2 className="qr-title">Digital Receipt Generated</h2>
             <p className="qr-sub">
               Batch Items: {checkoutData?.total_items || resultsList.length} | Halaga: ₱{checkoutData?.total_amount || grandTotal || 0}
             </p>
-            
             <div className="qr-wrapper-box receipt-space">
               <img src={receiptQrUrl} alt="Receipt QR" className="qr-img" />
             </div>
-
             <div className="receipt-btns-grid">
               <button className="history-btn receipt-btn-centered" onClick={onScanAgain}>
                 <FaUndo /> Scan More
@@ -452,11 +571,9 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                 >
                   <FaChevronLeft /> Prev
                 </button>
-
                 <span className="pagination-text">
                   Fruit {currentIndex + 1} of {resultsList.length}
                 </span>
-
                 <button 
                   onClick={() => setCurrentIndex(prev => Math.min(resultsList.length - 1, prev + 1))}
                   disabled={currentIndex === resultsList.length - 1}
@@ -464,6 +581,25 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                 >
                   Next <FaChevronRight />
                 </button>
+              </div>
+            )}
+
+            {isUnrecognized && (
+              <div style={{
+                backgroundColor: '#FEF2F2',
+                border: '1px solid #FCA5A5',
+                color: '#991B1B',
+                borderRadius: '12px',
+                padding: '12px 16px',
+                marginBottom: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '10px',
+                fontSize: '13px',
+                fontWeight: '600'
+              }}>
+                <FaExclamationTriangle size={18} color="#EF4444" />
+                <span>Babala: Mababa ang kumpiyansa ({confidenceVal}%). Hindi kabilang ang prutas sa dataset ng Sigla Ani.</span>
               </div>
             )}
 
@@ -484,18 +620,18 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
                     <h1 className="res-name">{fruitName}</h1>
                     <span className="res-sci">{scientificName}</span>
                   </div>
-                  <div className="res-price-col">
-                    <div className="res-price-val">
-                      ₱{pricePerKg}
+                  {!isUnrecognized && (
+                    <div className="res-price-col">
+                      <div className="res-price-val">₱{pricePerKg}</div>
+                      <span className="res-price-unit">per kilo</span>
                     </div>
-                    <span className="res-price-unit">per kilo</span>
-                  </div>
+                  )}
                 </div>
-                <StarRating rating={ratingVal} />
+                {!isUnrecognized && <StarRating rating={ratingVal} />}
               </div>
 
               <div className="res-rec-box">
-                <div className="res-rec-label">Storage Recommendation:</div>
+                <div className="res-rec-label">Storage Recommendation / Paalala:</div>
                 <div className="res-rec-text">"{recoText}"</div>
               </div>
             </div>
@@ -507,7 +643,7 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
               </div>
               <div className="res-meta-cell">
                 <div className="res-meta-label">Status</div>
-                <div className={`res-meta-val ${isRotten ? 'status-rotten' : 'status-fresh'}`}>
+                <div className={`res-meta-val ${isUnrecognized || isRotten ? 'status-rotten' : 'status-fresh'}`}>
                   {statusLabel}
                 </div>
               </div>
@@ -519,25 +655,24 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
 
             {/* ACTION CONTROLS */}
             <div className="result-footer-custom">
-              {/* Row 1: Add to Cart (Left) and View QR (Right) */}
               <div className="result-actions-row-top">
                 <button 
-                  onClick={handleAddToCart}
-                  disabled={isCurrentInCart || isRotten}
+                  onClick={handleAddToCartDirect}
+                  disabled={isCurrentInCart || isRotten || isUnrecognized}
                   className={`history-btn ${isCurrentInCart ? 'cart-btn-added' : 'cart-btn-unadded'}`}
                 >
-                  <FaCartPlus /> {isCurrentInCart ? "Added to Cart" : "Add to Cart"}
+                  <FaCartPlus /> {isUnrecognized ? "Hindi Maidadagdag" : (isCurrentInCart ? "Added to Cart" : "Add to Cart")}
                 </button>
 
                 <button 
                   className="history-btn btn-view-qr-top" 
                   onClick={() => setViewMode("inspect_qr")}
+                  disabled={isUnrecognized}
                 >
                   <FaQrcode /> View QR
                 </button>
               </div>
 
-              {/* Row 2: Centered full-width I-scan Muli button */}
               <div>
                 <button 
                   className="scan-again-btn btn-scan-again-centered" 
@@ -550,6 +685,19 @@ export default function ResultScreen({ result, scanId, onScanAgain, onHome }) {
           </div>
         )}
       </div>
+
+      {/* UNIFIED TOUCH NUMPAD MODAL (Weight & Tawad) */}
+      {numpadModal.isOpen && (
+        <WeightModal
+          mode={numpadModal.mode}
+          title={numpadModal.title}
+          subtitle={numpadModal.subtitle}
+          fruit={numpadModal.fruit}
+          pricePerKg={numpadModal.pricePerKg}
+          onCancel={() => setNumpadModal(prev => ({ ...prev, isOpen: false }))}
+          onConfirm={handleConfirmNumpad}
+        />
+      )}
     </div>
   );
 }
