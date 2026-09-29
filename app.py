@@ -2,7 +2,7 @@
 SiglaAni — Flask Backend
 """
 
-import os, sqlite3, base64, hashlib, random, threading, time, urllib.request, json
+import os, sqlite3, base64, hashlib, random, threading, time, urllib.request, json, re
 from datetime import datetime
 import numpy as np
 import cv2
@@ -22,7 +22,6 @@ XAI_MIN_CONFIDENCE = 60
 XAI_MIN_COVERAGE   = 0.015
 XAI_MAX_COVERAGE   = 0.85
 
-# Optional Cloud Sync Endpoint (Replace with your actual hosted endpoint or Supabase Edge function)
 CLOUD_SYNC_URL = os.environ.get("SIGLAANI_CLOUD_URL", "")
 
 app = Flask(__name__)
@@ -35,11 +34,30 @@ def add_header(response):
     response.headers['Expires']       = '-1'
     return response
 
-# ── Password Hashing Helper ──────────────────────────────────────────────────
+# ── Password Hashing & Validation Helpers ─────────────────────────────────────
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
-# In-memory store for active password reset verification codes
+def validate_password_strength(password: str):
+    if len(password) < 8:
+        return False, "Kailangang hindi bababa sa 8 characters ang password (At least 8 characters)."
+    if not re.search(r'[A-Z]', password):
+        return False, "Kailangang may kahit isang uppercase letter A-Z (At least 1 uppercase letter)."
+    if not re.search(r'[a-z]', password):
+        return False, "Kailangang may kahit isang lowercase letter a-z (At least 1 lowercase letter)."
+    if not re.search(r'\d', password):
+        return False, "Kailangang may kahit isang numero 0-9 (At least 1 number)."
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>_]', password):
+        return False, "Kailangang may kahit isang special character tulad ng !@#$%^&* o _ (At least 1 symbol)."
+    return True, ""
+
+def validate_ph_phone_number(phone: str):
+    clean_phone = re.sub(r'[\s\-()]', '', str(phone or ''))
+    pattern = r'^(09\d{9}|(\+?639)\d{9})$'
+    if not re.match(pattern, clean_phone):
+        return False, "Invalid mobile number. Gamitin ang format na 09XXXXXXXXX o +639XXXXXXXXX."
+    return True, clean_phone
+
 PASSWORD_RESET_CODES = {}
 
 # ── Metadata & Recommendations ────────────────────────────────────────────────
@@ -57,7 +75,6 @@ RECOMMENDATIONS = {
     "rotten":   "Ang prutas ay hindi na ligtas kainin. Itapon na ito agad para maiwasan ang kontaminasyon.",
 }
 
-# Supported fruits and scientific names
 FRUIT_METADATA = {
     "banana":     ("Banana",     "Musa acuminata"),
     "apple":      ("Apple",      "Malus domestica"),
@@ -67,16 +84,10 @@ FRUIT_METADATA = {
 }
 
 def parse_model_label(raw_label: str):
-    """
-    Parses Teachable Machine class labels (e.g. 'fresh_ripe_banana', 'unripe_mango', 'background_empty').
-    Returns: (fruit_display_name, scientific_name, condition_key, is_background)
-    """
     lbl = str(raw_label or "").strip().lower()
-
     if not lbl or "background" in lbl or "empty" in lbl:
         return None, None, None, True
 
-    # Identify Fruit
     fruit_name = "Fruit"
     sci_name = "SIGLA ANI AI"
     for key, (display_name, scientific) in FRUIT_METADATA.items():
@@ -85,7 +96,6 @@ def parse_model_label(raw_label: str):
             sci_name = scientific
             break
 
-    # Identify Condition
     if "overripe" in lbl:
         condition = "overripe"
     elif "unripe" in lbl:
@@ -131,29 +141,34 @@ def init_db():
             xai_generated    INTEGER DEFAULT 0,
             transaction_id   TEXT    DEFAULT NULL,
             is_purchased     INTEGER DEFAULT 0,
-            synced           INTEGER DEFAULT 0
+            synced           INTEGER DEFAULT 0,
+            is_archived      INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             transaction_id   TEXT PRIMARY KEY,
             vendor_name      TEXT DEFAULT 'Sigla Ani Kiosk - Valenzuela',
+            vendor_id        INTEGER DEFAULT NULL,
             total_amount     REAL DEFAULT 0.0,
             total_items      INTEGER DEFAULT 0,
             purchased_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            synced           INTEGER DEFAULT 0
+            synced           INTEGER DEFAULT 0,
+            is_archived      INTEGER DEFAULT 0
         )
     """)
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inventory (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            fruit_type       TEXT UNIQUE NOT NULL,
+            vendor_id        INTEGER DEFAULT NULL,
+            fruit_type       TEXT NOT NULL,
             stock_count      INTEGER DEFAULT 0,
             unit_price       REAL DEFAULT 20.0,
             price_per_kg     REAL DEFAULT 120.0,
             supplier_name    TEXT DEFAULT 'Valenzuela Local Market',
-            supplier_contact TEXT DEFAULT 'N/A'
+            supplier_contact TEXT DEFAULT 'N/A',
+            is_archived      INTEGER DEFAULT 0
         )
     """)
 
@@ -183,56 +198,19 @@ def init_db():
     conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-01', 'Valenzuela Market Kiosk #1')")
     conn.execute("INSERT OR IGNORE INTO kiosks (kiosk_code, kiosk_name) VALUES ('KSK-VAL-02', 'Valenzuela Market Kiosk #2')")
 
-    inv_cols = [
-        ("price_per_kg",     "REAL DEFAULT 120.0"),
-        ("supplier_name",    "TEXT DEFAULT 'Valenzuela Local Market'"),
-        ("supplier_contact", "TEXT DEFAULT 'N/A'")
+    migrations = [
+        ("inventory", "vendor_id", "INTEGER DEFAULT NULL"),
+        ("inventory", "is_archived", "INTEGER DEFAULT 0"),
+        ("scans", "is_archived", "INTEGER DEFAULT 0"),
+        ("transactions", "vendor_id", "INTEGER DEFAULT NULL"),
+        ("transactions", "is_archived", "INTEGER DEFAULT 0"),
+        ("users", "phone_number", "TEXT DEFAULT ''"),
     ]
-    for col, decl in inv_cols:
+    for tbl, col, decl in migrations:
         try:
-            conn.execute(f"ALTER TABLE inventory ADD COLUMN {col} {decl}")
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
         except sqlite3.OperationalError:
             pass
-
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN phone_number TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-
-    # Baseline seed inventory with Mango and Strawberry included
-    cur = conn.cursor()
-    for item in [
-        ("Apple",      50, 25.0, 140.0, "Valenzuela Local Market", "0917-123-4567"), 
-        ("Banana",     80, 15.0, 75.0,  "Bulacan Fruit Hub",       "0918-987-6543"), 
-        ("Orange",     40, 20.0, 120.0, "Divisoria Wholesale",     "0922-555-7890"),
-        ("Mango",      40, 30.0, 160.0, "Local Market",            "0919-333-1122"),
-        ("Strawberry", 25, 45.0, 350.0, "Baguio Farm Hub",         "0917-444-5566")
-    ]:
-        cur.execute("""
-            INSERT OR IGNORE INTO inventory (fruit_type, stock_count, unit_price, price_per_kg, supplier_name, supplier_contact)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, item)
-
-    new_cols = [
-        ("capture_filename", "TEXT DEFAULT ''"),
-        ("xai_filename",     "TEXT DEFAULT ''"),
-        ("xai_coverage",     "REAL DEFAULT 0"),
-        ("xai_explanation",  "TEXT DEFAULT ''"),
-        ("xai_generated",    "INTEGER DEFAULT 0"),
-        ("transaction_id",   "TEXT DEFAULT NULL"),
-        ("is_purchased",     "INTEGER DEFAULT 0"),
-        ("synced",           "INTEGER DEFAULT 0")
-    ]
-    for col, decl in new_cols:
-        try:
-            conn.execute(f"ALTER TABLE scans ADD COLUMN {col} {decl}")
-        except sqlite3.OperationalError:
-            pass
-
-    try:
-        conn.execute("ALTER TABLE transactions ADD COLUMN synced INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
 
     conn.commit()
     conn.close()
@@ -246,8 +224,8 @@ def save_scan(data: dict) -> int:
               (fruit, scientific, condition, condition_label,
                confidence, rating, recommendation, temp, thumbnail,
                capture_filename, xai_filename, xai_coverage,
-               xai_explanation, xai_generated, transaction_id, is_purchased, synced)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+               xai_explanation, xai_generated, transaction_id, is_purchased, synced, is_archived)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)
         """, (
             str(data.get("fruit",            "Unknown")),
             str(data.get("scientific",       "SIGLA ANI AI")),
@@ -271,20 +249,17 @@ def save_scan(data: dict) -> int:
     finally:
         conn.close()
 
-def get_history(limit=50):
+def get_history(limit=50, include_archived=False):
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT * FROM scans ORDER BY scanned_at DESC LIMIT ?", (limit,)
-        ).fetchall()
+        where = "WHERE is_archived = 0" if not include_archived else "WHERE is_archived = 1"
+        rows = conn.execute(f"SELECT * FROM scans {where} ORDER BY scanned_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
-# ── Background Store-and-Forward Sync Worker ─────────────────────────────────
 def check_internet(timeout=3):
-    """Checks if external internet is reachable."""
     try:
         urllib.request.urlopen("https://1.1.1.1", timeout=timeout)
         return True
@@ -292,17 +267,14 @@ def check_internet(timeout=3):
         return False
 
 def sync_worker_loop():
-    """Background worker that syncs offline transactions & scans when internet is restored."""
     while True:
         time.sleep(15)
         if not CLOUD_SYNC_URL or not check_internet():
             continue
-
         try:
             conn = sqlite3.connect(DB_PATH, timeout=15)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
-
             unsynced_txns = cur.execute("SELECT * FROM transactions WHERE synced = 0 LIMIT 25").fetchall()
             unsynced_scans = cur.execute("SELECT * FROM scans WHERE synced = 0 AND is_purchased = 1 LIMIT 50").fetchall()
 
@@ -314,7 +286,6 @@ def sync_worker_loop():
                 "transactions": [dict(t) for t in unsynced_txns],
                 "scans": [dict(s) for s in unsynced_scans]
             }
-
             req = urllib.request.Request(
                 CLOUD_SYNC_URL,
                 data=json.dumps(payload).encode("utf-8"),
@@ -324,7 +295,6 @@ def sync_worker_loop():
                 if resp.status == 200:
                     txn_ids = [t["transaction_id"] for t in unsynced_txns]
                     scan_ids = [s["id"] for s in unsynced_scans]
-
                     if txn_ids:
                         cur.execute(f"UPDATE transactions SET synced = 1 WHERE transaction_id IN ({','.join(['?']*len(txn_ids))})", txn_ids)
                     if scan_ids:
@@ -401,6 +371,15 @@ def register():
 
     if not username or not password or not phone_number:
         return jsonify({'success': False, 'message': 'Username, password, and phone number are required.'}), 400
+
+    is_phone_valid, phone_result = validate_ph_phone_number(phone_number)
+    if not is_phone_valid:
+        return jsonify({'success': False, 'message': phone_result}), 400
+    phone_number = phone_result
+
+    is_valid, err_msg = validate_password_strength(password)
+    if not is_valid:
+        return jsonify({'success': False, 'message': err_msg}), 400
 
     if role not in ('vendor', 'consumer'):
         return jsonify({'success': False, 'message': 'Invalid account role.'}), 400
@@ -480,10 +459,16 @@ def forgot_password():
     phone_raw = row[2] or ""
     masked_phone = f"******{phone_raw[-4:]}" if len(phone_raw) >= 4 else "your registered number"
 
+    print("\n" + "=" * 55, flush=True)
+    print(f"🔑 [SIGLA ANI OTP] Reset Code for '{username}': >>> {reset_code} <<<", flush=True)
+    print("=" * 55 + "\n", flush=True)
+
     return jsonify({
         'success': True,
         'message': f'Verification code has been sent via SMS to {masked_phone}.',
-        'masked_phone': masked_phone
+        'masked_phone': masked_phone,
+        'reset_code': reset_code,
+        'otp': reset_code
     }), 200
 
 @app.route('/api/reset-password', methods=['POST'])
@@ -499,14 +484,28 @@ def reset_password():
     if not new_password:
         return jsonify({'success': False, 'message': 'New password is required.'}), 400
 
+    is_valid, err_msg = validate_password_strength(new_password)
+    if not is_valid:
+        return jsonify({'success': False, 'message': err_msg}), 400
+
+    new_hash = hash_password(new_password)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     cursor = conn.cursor()
-    cursor.execute('UPDATE users SET password_hash = ? WHERE LOWER(username) = ?', (hash_password(new_password), username))
+
+    cursor.execute('SELECT password_hash FROM users WHERE LOWER(username) = ?', (username,))
+    user_row = cursor.fetchone()
+    if user_row and user_row[0] == new_hash:
+        conn.close()
+        return jsonify({
+            'success': False,
+            'message': 'Bawal gamitin ang dating password. Maglagay ng bagong password (Cannot reuse previous password).'
+        }), 400
+
+    cursor.execute('UPDATE users SET password_hash = ? WHERE LOWER(username) = ?', (new_hash, username))
     conn.commit()
     conn.close()
 
     del PASSWORD_RESET_CODES[username]
-
     return jsonify({'success': True, 'message': 'Password has been successfully reset! You can now sign in.'}), 200
 
 # ── Kiosk Synchronization Routes ──────────────────────────────────────────────
@@ -522,7 +521,6 @@ def sync_kiosk():
 
     conn = sqlite3.connect(DB_PATH, timeout=15)
     cursor = conn.cursor()
-
     cursor.execute('SELECT kiosk_code, kiosk_name, synced_vendor_id, synced_vendor_username FROM kiosks WHERE kiosk_code = ?', (kiosk_code,))
     kiosk = cursor.fetchone()
 
@@ -530,7 +528,7 @@ def sync_kiosk():
         conn.close()
         return jsonify({'success': False, 'message': f'Kiosk code "{kiosk_code}" not recognized.'}), 404
 
-    if kiosk[2] is not None and kiosk[2] != vendor_id:
+    if kiosk[2] is not None and str(kiosk[2]) != str(vendor_id):
         conn.close()
         return jsonify({
             'success': False,
@@ -575,10 +573,30 @@ def unsync_kiosk():
 # ── Inventory & Supplier Routes ───────────────────────────────────────────────
 @app.route("/api/inventory", methods=["GET"])
 def get_inventory():
+    kiosk_code = request.args.get("kiosk_code")
+    vendor_id = request.args.get("vendor_id")
+    view_archived = request.args.get("archived", "0") == "1"
+
+    if not kiosk_code:
+        return jsonify([]), 200
+
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute("SELECT * FROM inventory ORDER BY fruit_type ASC").fetchall()
+        kiosk = conn.execute(
+            "SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)
+        ).fetchone()
+
+        if not kiosk or (vendor_id and str(kiosk["synced_vendor_id"]) != str(vendor_id)):
+            return jsonify([]), 200
+
+        query = """
+            SELECT * FROM inventory 
+            WHERE is_archived = ? 
+              AND (vendor_id = ? OR vendor_id IS NULL)
+            ORDER BY fruit_type ASC
+        """
+        rows = conn.execute(query, (1 if view_archived else 0, vendor_id)).fetchall()
         return jsonify([dict(r) for r in rows]), 200
     finally:
         conn.close()
@@ -586,8 +604,9 @@ def get_inventory():
 @app.route("/api/inventory", methods=["POST"])
 def add_fruit_inventory():
     body = request.get_json(silent=True) or {}
+    vendor_id = body.get("vendor_id")
     fruit_type = str(body.get("fruit_type", "")).strip().capitalize()
-    stock_count = float(body.get("stock_kg", 50.0))
+    stock_count = float(body.get("stock_kg", body.get("stock_count", 50.0)))
     price_per_kg = float(body.get("price_per_kg", 100.0))
     supplier_name = str(body.get("supplier_name", "Valenzuela Local Market")).strip()
     supplier_contact = str(body.get("supplier_contact", "N/A")).strip()
@@ -598,19 +617,41 @@ def add_fruit_inventory():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     try:
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO inventory (fruit_type, stock_count, price_per_kg, unit_price, supplier_name, supplier_contact)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(fruit_type) DO UPDATE SET
-                stock_count = stock_count + excluded.stock_count,
-                price_per_kg = excluded.price_per_kg,
-                unit_price = excluded.unit_price,
-                supplier_name = excluded.supplier_name,
-                supplier_contact = excluded.supplier_contact
-        """, (fruit_type, stock_count, price_per_kg, price_per_kg, supplier_name, supplier_contact))
+        
+        # Explicit existence check: avoids SQLite ON CONFLICT index requirements
+        if vendor_id:
+            existing = cur.execute(
+                "SELECT id FROM inventory WHERE LOWER(fruit_type) = LOWER(?) AND (vendor_id = ? OR vendor_id IS NULL)",
+                (fruit_type, vendor_id)
+            ).fetchone()
+        else:
+            existing = cur.execute(
+                "SELECT id FROM inventory WHERE LOWER(fruit_type) = LOWER(?)",
+                (fruit_type,)
+            ).fetchone()
+
+        if existing:
+            cur.execute("""
+                UPDATE inventory 
+                SET stock_count = stock_count + ?,
+                    price_per_kg = ?,
+                    unit_price = ?,
+                    supplier_name = ?,
+                    supplier_contact = ?,
+                    is_archived = 0,
+                    vendor_id = COALESCE(vendor_id, ?)
+                WHERE id = ?
+            """, (stock_count, price_per_kg, price_per_kg, supplier_name, supplier_contact, vendor_id, existing[0]))
+        else:
+            cur.execute("""
+                INSERT INTO inventory (vendor_id, fruit_type, stock_count, price_per_kg, unit_price, supplier_name, supplier_contact, is_archived)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """, (vendor_id, fruit_type, stock_count, price_per_kg, price_per_kg, supplier_name, supplier_contact))
+
         conn.commit()
         return jsonify({"success": True, "message": f"Naidagdag ang {fruit_type} sa inventory!"}), 201
     except Exception as e:
+        print("[ADD FRUIT ERROR]:", e, flush=True)
         return jsonify({"error": "db_error", "message": str(e)}), 500
     finally:
         conn.close()
@@ -618,60 +659,198 @@ def add_fruit_inventory():
 @app.route("/api/inventory/<string:fruit_type>", methods=["PUT"])
 def update_fruit_inventory(fruit_type):
     body = request.get_json(silent=True) or {}
+    vendor_id = body.get("vendor_id")
     new_price = body.get("price_per_kg") or body.get("unit_price")
     new_stock = body.get("stock_count") if body.get("stock_count") is not None else body.get("stock_kg")
     supplier_name = body.get("supplier_name")
     supplier_contact = body.get("supplier_contact")
 
-    if all(v is None for v in [new_price, new_stock, supplier_name, supplier_contact]):
-        return jsonify({"error": "invalid_payload", "message": "Walang binigay na field para i-update."}), 400
-
     conn = sqlite3.connect(DB_PATH, timeout=15)
     try:
         cur = conn.cursor()
+        where_clause = "WHERE LOWER(fruit_type) = LOWER(?)"
+        params_base = [fruit_type]
+        if vendor_id:
+            where_clause += " AND (vendor_id = ? OR vendor_id IS NULL)"
+            params_base.append(vendor_id)
+
         if new_price is not None:
-            cur.execute("""
-                UPDATE inventory 
-                SET price_per_kg = ?, unit_price = ? 
-                WHERE LOWER(fruit_type) = LOWER(?)
-            """, (float(new_price), float(new_price), fruit_type))
+            cur.execute(f"UPDATE inventory SET price_per_kg = ?, unit_price = ? {where_clause}", [float(new_price), float(new_price)] + params_base)
         if new_stock is not None:
-            cur.execute("""
-                UPDATE inventory 
-                SET stock_count = ? 
-                WHERE LOWER(fruit_type) = LOWER(?)
-            """, (float(new_stock), fruit_type))
+            cur.execute(f"UPDATE inventory SET stock_count = ? {where_clause}", [float(new_stock)] + params_base)
         if supplier_name is not None:
-            cur.execute("""
-                UPDATE inventory 
-                SET supplier_name = ? 
-                WHERE LOWER(fruit_type) = LOWER(?)
-            """, (str(supplier_name), fruit_type))
+            cur.execute(f"UPDATE inventory SET supplier_name = ? {where_clause}", [str(supplier_name)] + params_base)
         if supplier_contact is not None:
-            cur.execute("""
-                UPDATE inventory 
-                SET supplier_contact = ? 
-                WHERE LOWER(fruit_type) = LOWER(?)
-            """, (str(supplier_contact), fruit_type))
-        conn.commit()
-        return jsonify({"success": True, "message": f"Updated {fruit_type} inventory & supplier info."}), 200
-    finally:
-        conn.close()
+            cur.execute(f"UPDATE inventory SET supplier_contact = ? {where_clause}", [str(supplier_contact)] + params_base)
 
-@app.route("/api/inventory/<string:fruit_type>", methods=["DELETE"])
-def delete_fruit_inventory(fruit_type):
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM inventory WHERE LOWER(fruit_type) = LOWER(?)", (fruit_type,))
         conn.commit()
-        return jsonify({"success": True, "message": f"Deleted {fruit_type} from inventory."}), 200
+        return jsonify({"success": True, "message": f"Updated {fruit_type} inventory."}), 200
     except Exception as e:
+        print("[UPDATE FRUIT ERROR]:", e, flush=True)
         return jsonify({"error": "db_error", "message": str(e)}), 500
     finally:
         conn.close()
 
-# ── Scan and Processing Endpoints ─────────────────────────────────────────────
+@app.route("/api/inventory/<string:fruit_type>", methods=["DELETE"])
+def archive_fruit_inventory(fruit_type):
+    vendor_id = request.args.get("vendor_id")
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        cur = conn.cursor()
+        if vendor_id:
+            cur.execute("""
+                UPDATE inventory 
+                SET is_archived = 1 
+                WHERE LOWER(fruit_type) = LOWER(?) 
+                  AND (vendor_id = ? OR vendor_id IS NULL)
+            """, (fruit_type, vendor_id))
+        else:
+            cur.execute("""
+                UPDATE inventory 
+                SET is_archived = 1 
+                WHERE LOWER(fruit_type) = LOWER(?)
+            """, (fruit_type,))
+
+        conn.commit()
+        return jsonify({"success": True, "message": f"Nai-archive ang {fruit_type}."}), 200
+    except Exception as e:
+        print("[ARCHIVE ERROR]:", e, flush=True)
+        return jsonify({"error": "db_error", "message": str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route("/api/inventory/<string:fruit_type>/restore", methods=["POST"])
+def restore_fruit_inventory(fruit_type):
+    vendor_id = request.args.get("vendor_id")
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        cur = conn.cursor()
+        if vendor_id:
+            cur.execute("""
+                UPDATE inventory 
+                SET is_archived = 0 
+                WHERE LOWER(fruit_type) = LOWER(?) 
+                  AND (vendor_id = ? OR vendor_id IS NULL)
+            """, (fruit_type, vendor_id))
+        else:
+            cur.execute("""
+                UPDATE inventory 
+                SET is_archived = 0 
+                WHERE LOWER(fruit_type) = LOWER(?)
+            """, (fruit_type,))
+
+        conn.commit()
+        return jsonify({"success": True, "message": f"Naibalik ang {fruit_type} sa active inventory."}), 200
+    except Exception as e:
+        print("[RESTORE ERROR]:", e, flush=True)
+        return jsonify({"error": "db_error", "message": str(e)}), 500
+    finally:
+        conn.close()
+
+# ── Permanent Hard Delete Endpoint ───────────────────────────────────────────
+@app.route("/api/inventory/<string:fruit_type>/permanent", methods=["DELETE"])
+def permanent_delete_fruit_inventory(fruit_type):
+    vendor_id = request.args.get("vendor_id")
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        cur = conn.cursor()
+        if vendor_id:
+            cur.execute("""
+                DELETE FROM inventory 
+                WHERE LOWER(fruit_type) = LOWER(?) 
+                  AND (vendor_id = ? OR vendor_id IS NULL)
+            """, (fruit_type, vendor_id))
+        else:
+            cur.execute("DELETE FROM inventory WHERE LOWER(fruit_type) = LOWER(?)", (fruit_type,))
+
+        conn.commit()
+        return jsonify({"success": True, "message": f"Tuluyang binura ang {fruit_type} sa database."}), 200
+    except Exception as e:
+        print("[PERMANENT DELETE ERROR]:", e, flush=True)
+        return jsonify({"error": "db_error", "message": str(e)}), 500
+    finally:
+        conn.close()
+
+# ── Sales History ────────────────────────────────────────────────────────────
+@app.route("/api/transactions", methods=["GET"])
+def get_transactions():
+    kiosk_code = request.args.get("kiosk_code")
+    vendor_id = request.args.get("vendor_id")
+    filter_preset = request.args.get("filter_preset")
+
+    if not kiosk_code:
+        return jsonify([]), 200
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        kiosk = conn.execute(
+            "SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)
+        ).fetchone()
+
+        if not kiosk or (vendor_id and str(kiosk["synced_vendor_id"]) != str(vendor_id)):
+            return jsonify([]), 200
+
+        query = """
+            SELECT * FROM transactions 
+            WHERE is_archived = 0 
+              AND (vendor_id = ? OR vendor_id IS NULL)
+        """
+        params = [vendor_id]
+
+        if filter_preset == 'today':
+            query += " AND DATE(purchased_at) = DATE('now', 'localtime')"
+        elif filter_preset == 'week':
+            query += " AND DATE(purchased_at) >= DATE('now', '-7 days', 'localtime')"
+        elif filter_preset == 'month':
+            query += " AND DATE(purchased_at) >= DATE('now', '-30 days', 'localtime')"
+
+        query += " ORDER BY purchased_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+    finally:
+        conn.close()
+
+# ── Inspection Scan Records ──────────────────────────────────────────────────
+@app.route("/api/history", methods=["GET"])
+def history():
+    kiosk_code = request.args.get("kiosk_code")
+    limit = int(request.args.get("limit", 50))
+    view_archived = request.args.get("archived", "0") == "1"
+
+    if not kiosk_code:
+        return jsonify([]), 200
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        kiosk = conn.execute("SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)).fetchone()
+        if not kiosk or not kiosk["synced_vendor_id"]:
+            return jsonify([]), 200
+
+        where = "WHERE is_archived = 0" if not view_archived else "WHERE is_archived = 1"
+        rows = conn.execute(f"SELECT * FROM scans {where} ORDER BY scanned_at DESC LIMIT ?", (limit,)).fetchall()
+        return jsonify([dict(r) for r in rows]), 200
+    finally:
+        conn.close()
+
+@app.route("/api/history/<int:scan_id>", methods=["DELETE"])
+def delete_scan(scan_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("UPDATE scans SET is_archived = 1 WHERE id = ?", (scan_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"archived": scan_id}), 200
+
+@app.route("/api/history/<int:scan_id>/restore", methods=["POST"])
+def restore_scan(scan_id):
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("UPDATE scans SET is_archived = 0 WHERE id = ?", (scan_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"restored": scan_id}), 200
+
+# ── Core Scanning and Checkout Endpoints ─────────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
 def scan():
     body = request.get_json(silent=True) or {}
@@ -706,10 +885,8 @@ def scan():
         cur = conn.cursor()
         for idx, item in enumerate(fruits_list):
             raw_label = str(item.get("detected_fruit") or "").strip()
-            
             fruit_display, sci, parsed_condition, is_bg = parse_model_label(raw_label)
 
-            # Skip background or empty tray detections
             if is_bg:
                 continue
 
@@ -722,7 +899,7 @@ def scan():
             crop, _ = get_analysis_region(frame, bbox)
             crop_filename = save_crop_image(crop, prefix=f"crop_{fruit_display.lower()}_{idx+1}")
 
-            inv = cur.execute("SELECT price_per_kg, unit_price FROM inventory WHERE LOWER(fruit_type) = LOWER(?)", (fruit_display,)).fetchone()
+            inv = cur.execute("SELECT price_per_kg, unit_price FROM inventory WHERE LOWER(fruit_type) = LOWER(?) AND is_archived = 0", (fruit_display,)).fetchone()
             price_per_kg = inv["price_per_kg"] if inv and "price_per_kg" in inv.keys() else (inv["unit_price"] if inv else 100.0)
 
             result_item = {
@@ -758,8 +935,8 @@ def scan():
             }), 200
 
         cur.execute("""
-            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items, synced)
-            VALUES (?, ?, ?, ?, 0)
+            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items, synced, is_archived)
+            VALUES (?, ?, ?, ?, 0, 0)
         """, (transaction_id, "Sigla Ani Kiosk - Valenzuela", len(analyzed_results) * 20.0, len(analyzed_results)))
         conn.commit()
     finally:
@@ -772,25 +949,26 @@ def scan():
         "results":        analyzed_results
     }), 200
 
-# ── Batch Checkout Endpoint ───────────────────────────────────────────────────
 @app.route("/api/checkout", methods=["POST"])
 def checkout():
     body = request.get_json(silent=True) or {}
-    if isinstance(body, list):
-        scan_ids = body
-        passed_total = None
-        fruit_breakdown = []
-        vendor_name = "Sigla Ani Kiosk - Valenzuela"
-    else:
-        scan_ids = body.get("scan_ids") or []
-        vendor_name = body.get("vendor_name", "Sigla Ani Kiosk - Valenzuela")
-        passed_total = body.get("total_amount")
-        fruit_breakdown = body.get("fruit_breakdown") or []
+    kiosk_code = body.get("kiosk_code")
+    scan_ids = body.get("scan_ids") or []
+    vendor_name = body.get("vendor_name", "Sigla Ani Kiosk - Valenzuela")
+    passed_total = body.get("total_amount")
+    fruit_breakdown = body.get("fruit_breakdown") or []
 
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
         cur = conn.cursor()
+        
+        assigned_vendor_id = None
+        if kiosk_code:
+            k_row = cur.execute("SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)).fetchone()
+            if k_row and k_row["synced_vendor_id"]:
+                assigned_vendor_id = k_row["synced_vendor_id"]
+
         clean_ids = [int(x) for x in scan_ids if str(x).isdigit()]
         rows = []
         if clean_ids:
@@ -807,7 +985,7 @@ def checkout():
                 cur.execute("""
                     UPDATE inventory 
                     SET stock_count = MAX(0, stock_count - ?) 
-                    WHERE LOWER(fruit_type) = LOWER(?)
+                    WHERE LOWER(fruit_type) = LOWER(?) AND is_archived = 0
                 """, (w_kg, f_type))
             final_amount = float(passed_total) if passed_total is not None else 100.0
         else:
@@ -829,20 +1007,20 @@ def checkout():
                 total_items_count += qty
                 for _ in range(qty):
                     cur.execute("""
-                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced)
-                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0)
+                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
+                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
                     """, (f_type, transaction_id))
         else:
             total_items_count = 1
             cur.execute("""
-                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced)
-                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0)
+                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
+                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
             """, (transaction_id,))
 
         cur.execute("""
-            INSERT INTO transactions (transaction_id, vendor_name, total_amount, total_items, synced)
-            VALUES (?, ?, ?, ?, 0)
-        """, (transaction_id, vendor_name, round(final_amount, 2), total_items_count))
+            INSERT INTO transactions (transaction_id, vendor_name, vendor_id, total_amount, total_items, synced, is_archived)
+            VALUES (?, ?, ?, ?, ?, 0, 0)
+        """, (transaction_id, vendor_name, assigned_vendor_id, round(final_amount, 2), total_items_count))
 
         conn.commit()
 
@@ -858,7 +1036,7 @@ def checkout():
     finally:
         conn.close()
 
-# ── Static File Serving ───────────────────────────────────────────────────────
+# ── Static File Serving & Receipts ───────────────────────────────────────────
 @app.route("/captures/<path:filename>")
 def serve_capture(filename):
     return send_from_directory(CAPTURE_DIR, filename)
@@ -922,29 +1100,7 @@ def get_scan_by_id(scan_id):
     finally:
         conn.close()
 
-@app.route("/api/history", methods=["GET"])
-def history():
-    limit = int(request.args.get("limit", 50))
-    return jsonify(get_history(limit)), 200
-
-@app.route("/api/history/<int:scan_id>", methods=["DELETE"])
-def delete(scan_id):
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
-    conn.commit()
-    conn.close()
-    return jsonify({"deleted": scan_id}), 200
-
-@app.route("/api/history", methods=["DELETE"])
-def clear():
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.execute("DELETE FROM scans")
-    conn.commit()
-    conn.close()
-    return jsonify({"cleared": True}), 200
-
 if __name__ == "__main__":
     init_db()
-    # Start background store-and-forward sync thread
     threading.Thread(target=sync_worker_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=True)
