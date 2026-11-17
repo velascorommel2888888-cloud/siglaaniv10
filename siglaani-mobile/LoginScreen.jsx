@@ -18,8 +18,24 @@ import { Feather, Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BASE_URL } from './config';
 import { loginStyles } from './loginStyles';
+import PasswordStrengthMeter from './PasswordStrengthMeter';
 
 const STORAGE_AUTH_USER_KEY = '@siglaani_auth_user';
+
+const isValidPhoneNumber = (phone) => {
+  const clean = phone.replace(/[\s\-()]/g, '');
+  return /^(09\d{9}|(\+?639)\d{9})$/.test(clean);
+};
+
+// Helper to check password strength locally before network round-trip
+const isStrongPassword = (pass) => {
+  if (pass.length < 8) return false;
+  if (!/[A-Z]/.test(pass)) return false;
+  if (!/[a-z]/.test(pass)) return false;
+  if (!/\d/.test(pass)) return false;
+  if (!/[!@#$%^&*(),.?":{}|<>_]/.test(pass)) return false;
+  return true;
+};
 
 export default function LoginScreen({ onLoginSuccess }) {
   const [authMode, setAuthMode] = useState('login'); // 'login', 'register', or 'forgot'
@@ -65,18 +81,24 @@ export default function LoginScreen({ onLoginSuccess }) {
     const cleanUser = username.trim();
     const cleanPass = password.trim();
 
-    if (!cleanUser || !cleanPass) {
-      Alert.alert('Required Fields', 'Please enter your username and password.');
-      return;
-    }
-
     if (authMode === 'register') {
       if (!phoneNumber.trim()) {
         Alert.alert('Required Fields', 'Please enter your phone number for account recovery.');
         return;
       }
+      if (!isValidPhoneNumber(phoneNumber.trim())) {
+        Alert.alert('Invalid Number', 'Please enter a valid Philippine mobile number (e.g., 09123456789).');
+        return;
+      }
       if (selectedRole === 'vendor' && !fullName.trim()) {
         Alert.alert('Required Fields', 'Please enter your store or vendor name.');
+        return;
+      }
+      if (!isStrongPassword(cleanPass)) {
+        Alert.alert(
+          'Weak Password',
+          'Password must have at least 8 characters, including uppercase, lowercase, a number, and a symbol (!@#$_).'
+        );
         return;
       }
       if (cleanPass !== confirmPassword.trim()) {
@@ -158,6 +180,14 @@ export default function LoginScreen({ onLoginSuccess }) {
       return;
     }
 
+    if (!isStrongPassword(newPassword.trim())) {
+      Alert.alert(
+        'Weak Password',
+        'Password must have at least 8 characters, including uppercase, lowercase, a number, and a symbol (!@#$).'
+      );
+      return;
+    }
+
     setLoading(true);
     try {
       const res = await fetch(`${BASE_URL}/api/reset-password`, {
@@ -172,7 +202,7 @@ export default function LoginScreen({ onLoginSuccess }) {
       const resJson = await res.json();
 
       if (!res.ok || !resJson.success) {
-        Alert.alert('Reset Failed', resJson.message || 'Invalid code.');
+        Alert.alert('Reset Failed', resJson.message || 'Invalid code or password.');
         return;
       }
 
@@ -393,6 +423,9 @@ export default function LoginScreen({ onLoginSuccess }) {
                       <Feather name={showPassword ? 'eye' : 'eye-off'} size={18} color="#64748B" />
                     </TouchableOpacity>
                   </View>
+
+                  {/* Password Strength Meter for New Password */}
+                  <PasswordStrengthMeter password={newPassword} />
                 </>
               )}
 
@@ -417,6 +450,11 @@ export default function LoginScreen({ onLoginSuccess }) {
                       <Feather name={showPassword ? 'eye' : 'eye-off'} size={18} color="#64748B" />
                     </TouchableOpacity>
                   </View>
+
+                  {/* Password Strength Meter only on Register */}
+                  {authMode === 'register' && (
+                    <PasswordStrengthMeter password={password} />
+                  )}
 
                   {/* Forgot Password Link on Sign In */}
                   {authMode === 'login' && (

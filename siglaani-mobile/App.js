@@ -19,7 +19,9 @@ import { Feather, Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BASE_URL } from './config';
 import { vendorStyles, COLORS, styles as baseStyles } from './styles';
+import { STATUS_COLORS } from './themeColors';
 import LoginScreen from './LoginScreen';
+import DateFilterBar from './DateFilterBar';
 
 const STORAGE_RECEIPTS_KEY = '@siglaani_receipts';
 const STORAGE_INSPECTIONS_KEY = '@siglaani_inspections';
@@ -105,7 +107,8 @@ function MainApp() {
   const [inspections, setInspections] = useState([]);
   const [expandedTxn, setExpandedTxn] = useState(null);
 
-  // Inventory States
+  // Inventory States & Archive Toggle
+  const [inventoryTab, setInventoryTab] = useState('active'); // 'active' or 'archived'
   const [activeFilter, setActiveFilter] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [inventoryList, setInventoryList] = useState([]);
@@ -127,9 +130,11 @@ function MainApp() {
   const [kioskCodeInput, setKioskCodeInput] = useState('');
   const [syncingKiosk, setSyncingKiosk] = useState(false);
 
-  // Analytics & Sales States
+  // Analytics & Sales States with Date Filter
   const [serverHistory, setServerHistory] = useState([]);
   const [salesList, setSalesList] = useState([]);
+  const [salesFilterPreset, setSalesFilterPreset] = useState('all');
+  const [loadingSales, setLoadingSales] = useState(false);
 
   // Add Fruit Modal State
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
@@ -169,49 +174,83 @@ function MainApp() {
     await AsyncStorage.removeItem(STORAGE_AUTH_USER_KEY);
     setCurrentUser(null);
     setSelectedFruit(null);
+    setInventoryList([]);
+    setSalesList([]);
+    setServerHistory([]);
   };
 
+  // Vendor Scoped Inventory: Zero if kiosk is unpaired
   const fetchVendorInventory = useCallback(async () => {
+    if (!currentUser) return;
+
+    if (!currentUser.synced_kiosk_code) {
+      setInventoryList([]);
+      setLoadingInv(false);
+      return;
+    }
+
     setLoadingInv(true);
     try {
-      const res = await fetch(`${BASE_URL}/api/inventory`);
+      const isArchived = inventoryTab === 'archived' ? '1' : '0';
+      const res = await fetch(
+        `${BASE_URL}/api/inventory?vendor_id=${currentUser.id}&kiosk_code=${encodeURIComponent(currentUser.synced_kiosk_code)}&archived=${isArchived}`
+      );
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data)) setInventoryList(data);
+        setInventoryList(Array.isArray(data) ? data : []);
       }
     } catch (err) {
       console.warn('Could not fetch inventory:', err);
     } finally {
       setLoadingInv(false);
     }
-  }, []);
+  }, [currentUser, inventoryTab]);
 
-  const fetchAnalyticsAndSales = useCallback(async () => {
+  // Dashboard & Sales: Zero if kiosk is unpaired
+  const fetchAnalyticsAndSales = useCallback(async (preset = salesFilterPreset) => {
+    if (!currentUser) return;
+
+    if (!currentUser.synced_kiosk_code) {
+      setServerHistory([]);
+      setSalesList([]);
+      setLoadingSales(false);
+      return;
+    }
+
+    setLoadingSales(true);
     try {
-      const [histRes, recData] = await Promise.all([
-        fetch(`${BASE_URL}/api/history?limit=200`).catch(() => null),
-        AsyncStorage.getItem(STORAGE_RECEIPTS_KEY)
+      const [histRes, txnRes] = await Promise.all([
+        fetch(`${BASE_URL}/api/history?kiosk_code=${encodeURIComponent(currentUser.synced_kiosk_code)}&limit=200`).catch(() => null),
+        fetch(`${BASE_URL}/api/transactions?vendor_id=${currentUser.id}&kiosk_code=${encodeURIComponent(currentUser.synced_kiosk_code)}&filter_preset=${preset}`).catch(() => null)
       ]);
 
       if (histRes && histRes.ok) {
         const hData = await histRes.json();
-        setServerHistory(Array.isArray(hData) ? hData : (hData.history || []));
+        setServerHistory(Array.isArray(hData) ? hData : []);
       }
 
-      if (recData) {
-        setSalesList(JSON.parse(recData));
+      if (txnRes && txnRes.ok) {
+        const tData = await txnRes.json();
+        setSalesList(Array.isArray(tData) ? tData : []);
       }
     } catch (err) {
       console.warn('Could not fetch sales:', err);
+    } finally {
+      setLoadingSales(false);
     }
-  }, []);
+  }, [currentUser, salesFilterPreset]);
 
   useEffect(() => {
     if (currentUser && role === 'vendor') {
       fetchVendorInventory();
-      fetchAnalyticsAndSales();
     }
-  }, [currentUser, role, fetchVendorInventory, fetchAnalyticsAndSales]);
+  }, [currentUser, role, inventoryTab, currentUser?.synced_kiosk_code, fetchVendorInventory]);
+
+  useEffect(() => {
+    if (currentUser && role === 'vendor') {
+      fetchAnalyticsAndSales(salesFilterPreset);
+    }
+  }, [currentUser, role, salesFilterPreset, currentUser?.synced_kiosk_code, fetchAnalyticsAndSales]);
 
   const filteredInventory = useMemo(() => {
     return inventoryList.filter((item) => {
@@ -389,6 +428,7 @@ function MainApp() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          vendor_id: currentUser.id,
           price_per_kg: parseFloat(editPrice) || 100,
           stock_count: finalStock,
           stock_kg: finalStock,
@@ -411,27 +451,28 @@ function MainApp() {
     }
   };
 
-  const handleDeleteFruit = () => {
-    if (!selectedFruit) return;
+  // Archive Fruit (Soft Delete)
+  const handleArchiveFruit = (fruitType) => {
     Alert.alert(
-      'Delete Fruit?',
-      `Are you sure you want to remove "${selectedFruit.fruit_type}" from inventory?`,
+      'Archive Fruit?',
+      `Are you sure you want to archive "${fruitType}"? It will be moved to Archived Records and can be restored at any time.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Delete',
+          text: 'Archive',
           style: 'destructive',
           onPress: async () => {
             try {
-              const res = await fetch(`${BASE_URL}/api/inventory/${encodeURIComponent(selectedFruit.fruit_type)}`, {
+              const res = await fetch(`${BASE_URL}/api/inventory/${encodeURIComponent(fruitType)}?vendor_id=${currentUser.id}`, {
                 method: 'DELETE',
               });
-              if (res.ok) {
-                Alert.alert('Deleted', `${selectedFruit.fruit_type} has been removed.`);
+              const data = await res.json();
+              if (res.ok && data.success) {
+                Alert.alert('Archived', data.message);
                 await fetchVendorInventory();
                 setSelectedFruit(null);
               } else {
-                throw new Error('Failed to delete on server.');
+                throw new Error(data.message || 'Failed to archive on server.');
               }
             } catch (err) {
               Alert.alert('Error', err.message || 'Connection error.');
@@ -442,7 +483,61 @@ function MainApp() {
     );
   };
 
+  // Restore Fruit
+  const handleRestoreFruit = async (fruitType) => {
+    try {
+      const res = await fetch(`${BASE_URL}/api/inventory/${encodeURIComponent(fruitType)}/restore?vendor_id=${currentUser.id}`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        Alert.alert('Restored', `${fruitType} has been returned to active inventory.`);
+        await fetchVendorInventory();
+      } else {
+        Alert.alert('Error', data.message || 'Could not restore fruit.');
+      }
+    } catch (err) {
+      Alert.alert('Error', 'Connection error.');
+    }
+  };
+
+  // Permanent Hard Delete Fruit
+  const handlePermanentDeleteFruit = (fruitType) => {
+    Alert.alert(
+      'Permanent Deletion',
+      `Are you sure you want to permanently delete "${fruitType}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete Forever',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const res = await fetch(
+                `${BASE_URL}/api/inventory/${encodeURIComponent(fruitType)}/permanent?vendor_id=${currentUser?.id || ''}`,
+                { method: 'DELETE' }
+              );
+              const data = await res.json();
+              if (res.ok && data.success) {
+                Alert.alert('Deleted', data.message);
+                await fetchVendorInventory();
+              } else {
+                Alert.alert('Error', data.message || 'Could not delete item.');
+              }
+            } catch (err) {
+              Alert.alert('Error', 'Connection error.');
+            }
+          }
+        }
+      ]
+    );
+  };
+
   const handleCreateNewFruit = async () => {
+    if (!currentUser?.synced_kiosk_code) {
+      Alert.alert('Kiosk Required', 'Mag-sync muna sa kiosk bago magdagdag ng prutas.');
+      return;
+    }
     if (!newFruitName.trim()) {
       Alert.alert('Kulang na Datos', 'Ilagay ang pangalan ng prutas.');
       return;
@@ -452,6 +547,7 @@ function MainApp() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          vendor_id: currentUser.id,
           fruit_type: newFruitName.trim(),
           stock_kg: parseFloat(newStockKg) || 50,
           stock_count: parseFloat(newStockKg) || 50,
@@ -459,17 +555,20 @@ function MainApp() {
           supplier_name: newSupplierName.trim() || 'Valenzuela Local Market',
         })
       });
-      if (res.ok) {
-        Alert.alert('Tagumpay', `Naidagdag ang ${newFruitName} sa imbentaryo.`);
+      const data = await res.json();
+      if (res.ok && data.success) {
+        Alert.alert('Tagumpay', data.message);
         setIsAddModalOpen(false);
         setNewFruitName('');
         setNewStockKg('50');
         setNewPricePerKg('100');
         setNewSupplierName('');
         fetchVendorInventory();
+      } else {
+        Alert.alert('Error', data.message || 'Could not add fruit.');
       }
     } catch (err) {
-      Alert.alert('Error', err.message || 'May problema sa koneksyon.');
+      Alert.alert('Error', 'May problema sa koneksyon.');
     }
   };
 
@@ -532,6 +631,11 @@ function MainApp() {
                 const updatedUser = { ...currentUser, synced_kiosk_code: null };
                 setCurrentUser(updatedUser);
                 await AsyncStorage.setItem(STORAGE_AUTH_USER_KEY, JSON.stringify(updatedUser));
+                
+                // Reset state to empty
+                setInventoryList([]);
+                setSalesList([]);
+                setServerHistory([]);
                 Alert.alert('Unpaired', 'Kiosk has been released.');
               }
             } catch (err) {
@@ -871,10 +975,12 @@ function MainApp() {
               </TouchableOpacity>
             </View>
 
-            {/* Delete Fruit Option */}
-            <TouchableOpacity style={vendorStyles.deleteFruitBtn} onPress={handleDeleteFruit}>
-              <Feather name="trash-2" size={16} color="#DC2626" />
-              <Text style={vendorStyles.deleteFruitBtnText}>Delete Fruit from Inventory</Text>
+            {/* Archive Fruit Option (Replaces Hard Delete) */}
+            <TouchableOpacity style={vendorStyles.deleteFruitBtn} onPress={() => handleArchiveFruit(selectedFruit.fruit_type)}>
+              <Feather name="archive" size={16} color={STATUS_COLORS.FAILED} />
+              <Text style={[vendorStyles.deleteFruitBtnText, { color: STATUS_COLORS.FAILED }]}>
+                Archive Fruit (Move to Archive)
+              </Text>
             </TouchableOpacity>
           </ScrollView>
         ) : (
@@ -886,12 +992,12 @@ function MainApp() {
                 <Text style={vendorStyles.pageHeading}>Dashboard</Text>
                 <Text style={vendorStyles.pageSubheading}>Kiosk analytics, freshness metrics and status.</Text>
 
-                <View style={[vendorStyles.metricCard, { borderLeftColor: '#16a34a' }]}>
+                <View style={[vendorStyles.metricCard, { borderLeftColor: STATUS_COLORS.SUCCESS }]}>
                   <Text style={vendorStyles.metricLabel}>Kabuuang Na-scan sa Kiosk</Text>
                   <Text style={vendorStyles.metricValue}>{totalScans}</Text>
                 </View>
 
-                <View style={[vendorStyles.metricCard, { borderLeftColor: '#eab308' }]}>
+                <View style={[vendorStyles.metricCard, { borderLeftColor: STATUS_COLORS.WARNING }]}>
                   <Text style={vendorStyles.metricLabel}>Nangungunang Prutas</Text>
                   <Text style={vendorStyles.metricValue}>{topFruit} {maxCount > 0 ? `(${maxCount} scans)` : ''}</Text>
                 </View>
@@ -948,7 +1054,30 @@ function MainApp() {
               <View style={{ flex: 1 }}>
                 <View style={vendorStyles.contentBanner}>
                   <Text style={vendorStyles.pageHeading}>Inventory</Text>
-                  <Text style={vendorStyles.pageSubheading}>Manage your fruit stock, prices and updates.</Text>
+                  <Text style={vendorStyles.pageSubheading}>Manage your fruit stock, prices and archives.</Text>
+
+                  {/* ── ARCHIVE TOGGLE SWITCHER ── */}
+                  <View style={inlineStyles.archiveSwitchWrap}>
+                    <TouchableOpacity
+                      style={[inlineStyles.archiveSwitchBtn, inventoryTab === 'active' && inlineStyles.archiveSwitchBtnActive]}
+                      onPress={() => setInventoryTab('active')}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[inlineStyles.archiveSwitchText, inventoryTab === 'active' && inlineStyles.archiveSwitchTextActive]}>
+                        Active Stock
+                      </Text>
+                    </TouchableOpacity>
+
+                    <TouchableOpacity
+                      style={[inlineStyles.archiveSwitchBtn, inventoryTab === 'archived' && inlineStyles.archiveSwitchBtnActive]}
+                      onPress={() => setInventoryTab('archived')}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[inlineStyles.archiveSwitchText, inventoryTab === 'archived' && inlineStyles.archiveSwitchTextActive]}>
+                        Archived Records
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
 
                   <View style={vendorStyles.searchAndAddRow}>
                     <View style={vendorStyles.searchBarWrap}>
@@ -961,25 +1090,29 @@ function MainApp() {
                         onChangeText={setSearchQuery}
                       />
                     </View>
-                    <TouchableOpacity style={vendorStyles.addFruitBtn} onPress={() => setIsAddModalOpen(true)}>
-                      <Feather name="plus" size={14} color="#FFFFFF" />
-                      <Text style={vendorStyles.addFruitBtnText}>Add Fruit</Text>
-                    </TouchableOpacity>
+                    {inventoryTab === 'active' && currentUser?.synced_kiosk_code && (
+                      <TouchableOpacity style={vendorStyles.addFruitBtn} onPress={() => setIsAddModalOpen(true)}>
+                        <Feather name="plus" size={14} color="#FFFFFF" />
+                        <Text style={vendorStyles.addFruitBtnText}>Add Fruit</Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
 
-                  <View style={vendorStyles.filterPillRow}>
-                    {['All', 'Available', 'Out of Stock'].map(pill => (
-                      <TouchableOpacity
-                        key={pill}
-                        style={[vendorStyles.filterPill, activeFilter === pill && vendorStyles.filterPillActive]}
-                        onPress={() => setActiveFilter(pill)}
-                      >
-                        <Text style={[vendorStyles.filterPillText, activeFilter === pill && vendorStyles.filterPillTextActive]}>
-                          {pill}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
+                  {inventoryTab === 'active' && (
+                    <View style={vendorStyles.filterPillRow}>
+                      {['All', 'Available', 'Out of Stock'].map(pill => (
+                        <TouchableOpacity
+                          key={pill}
+                          style={[vendorStyles.filterPill, activeFilter === pill && vendorStyles.filterPillActive]}
+                          onPress={() => setActiveFilter(pill)}
+                        >
+                          <Text style={[vendorStyles.filterPillText, activeFilter === pill && vendorStyles.filterPillTextActive]}>
+                            {pill}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  )}
                 </View>
 
                 <View style={vendorStyles.tableHeaderRow}>
@@ -990,7 +1123,7 @@ function MainApp() {
                 </View>
 
                 {loadingInv ? (
-                  <ActivityIndicator size="large" color="#1E5E3A" style={{ marginTop: 40 }} />
+                  <ActivityIndicator size="large" color={STATUS_COLORS.PRIMARY_GREEN} style={{ marginTop: 40 }} />
                 ) : (
                   <FlatList
                     data={filteredInventory}
@@ -1020,14 +1153,44 @@ function MainApp() {
                           </View>
 
                           <View style={vendorStyles.fruitRowActionCol}>
-                            <TouchableOpacity
-                              style={vendorStyles.actionEditCircle}
-                              onPress={() => handleOpenEdit(item)}
-                              activeOpacity={0.7}
-                            >
-                              <Feather name="edit-2" size={13} color="#1E5E3A" />
-                            </TouchableOpacity>
-                            <Feather name="chevron-right" size={16} color="#CBD5E1" />
+                            {inventoryTab === 'active' ? (
+                              <>
+                                <TouchableOpacity
+                                  style={vendorStyles.actionEditCircle}
+                                  onPress={() => handleOpenEdit(item)}
+                                  activeOpacity={0.7}
+                                >
+                                  <Feather name="edit-2" size={13} color={STATUS_COLORS.PRIMARY_GREEN} />
+                                </TouchableOpacity>
+                                <TouchableOpacity
+                                  style={[vendorStyles.actionEditCircle, { backgroundColor: STATUS_COLORS.FAILED_BG, marginLeft: 4 }]}
+                                  onPress={() => handleArchiveFruit(item.fruit_type)}
+                                  activeOpacity={0.7}
+                                >
+                                  <Feather name="archive" size={13} color={STATUS_COLORS.FAILED} />
+                                </TouchableOpacity>
+                              </>
+                            ) : (
+                              <View style={{ flexDirection: 'row', gap: 6 }}>
+                                {/* Restore button */}
+                                <TouchableOpacity
+                                  style={[vendorStyles.actionEditCircle, { backgroundColor: STATUS_COLORS.SUCCESS_BG, width: 34, height: 34 }]}
+                                  onPress={() => handleRestoreFruit(item.fruit_type)}
+                                  activeOpacity={0.7}
+                                >
+                                  <Feather name="rotate-ccw" size={14} color={STATUS_COLORS.SUCCESS} />
+                                </TouchableOpacity>
+
+                                {/* Permanent delete button */}
+                                <TouchableOpacity
+                                  style={[vendorStyles.actionEditCircle, { backgroundColor: STATUS_COLORS.FAILED_BG, width: 34, height: 34 }]}
+                                  onPress={() => handlePermanentDeleteFruit(item.fruit_type)}
+                                  activeOpacity={0.7}
+                                >
+                                  <Feather name="trash-2" size={14} color={STATUS_COLORS.FAILED} />
+                                </TouchableOpacity>
+                              </View>
+                            )}
                           </View>
                         </View>
                       );
@@ -1036,7 +1199,11 @@ function MainApp() {
                     contentContainerStyle={{ paddingBottom: 20 }}
                     ListEmptyComponent={
                       <Text style={{ textAlign: 'center', marginTop: 40, color: '#94A3B8' }}>
-                        No fruits found matching "{activeFilter}".
+                        {!currentUser?.synced_kiosk_code
+                          ? 'No kiosk paired. Pair with a kiosk station in Profile to manage inventory.'
+                          : inventoryTab === 'active'
+                          ? `No fruits found matching "${activeFilter}". Tap "Add Fruit" to begin.`
+                          : 'No archived fruits.'}
                       </Text>
                     }
                   />
@@ -1044,25 +1211,39 @@ function MainApp() {
               </View>
             )}
 
-            {/* TAB 3: SALES */}
+            {/* TAB 3: SALES WITH DATE FILTER */}
             {vendorNavTab === 'sales' && (
-              <ScrollView contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
-                <Text style={vendorStyles.pageHeading}>Sales History</Text>
-                <Text style={vendorStyles.pageSubheading}>Transactions completed at the kiosk checkout.</Text>
+              <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
+                <View style={{ paddingHorizontal: 16, paddingTop: 16 }}>
+                  <Text style={vendorStyles.pageHeading}>Sales History</Text>
+                  <Text style={vendorStyles.pageSubheading}>Transactions completed at the kiosk checkout.</Text>
+                </View>
 
-                {salesList.length === 0 ? (
-                  <View style={vendorStyles.sectionCard}>
+                {/* ── DATE FILTER BAR COMPONENT ── */}
+                <DateFilterBar
+                  selectedPreset={salesFilterPreset}
+                  onSelectPreset={(preset) => setSalesFilterPreset(preset)}
+                />
+
+                {loadingSales ? (
+                  <ActivityIndicator size="small" color={STATUS_COLORS.PRIMARY_GREEN} style={{ marginTop: 20 }} />
+                ) : salesList.length === 0 ? (
+                  <View style={[vendorStyles.sectionCard, { marginHorizontal: 16 }]}>
                     <Text style={{ color: '#64748B', textAlign: 'center', paddingVertical: 20 }}>
-                      No customer checkouts recorded yet.
+                      {!currentUser?.synced_kiosk_code
+                        ? 'No transactions found. Connect to a kiosk station to view sales.'
+                        : 'No transactions found for the selected time range.'}
                     </Text>
                   </View>
                 ) : (
-                  <>
+                  <View style={{ paddingHorizontal: 16 }}>
                     {salesList.map((sale, idx) => (
                       <View key={sale.transaction_id || idx} style={vendorStyles.saleTxnCard}>
                         <View style={vendorStyles.saleTxnHeader}>
                           <Text style={vendorStyles.saleTxnId}>{sale.transaction_id || 'TXN'}</Text>
-                          <Text style={vendorStyles.saleTxnAmount}>₱{sale.total_amount || 25}</Text>
+                          <Text style={[vendorStyles.saleTxnAmount, { color: STATUS_COLORS.SUCCESS }]}>
+                            ₱{Number(sale.total_amount || 25).toFixed(2)}
+                          </Text>
                         </View>
                         <Text style={vendorStyles.saleTxnDate}>
                           {sale.purchased_at ? new Date(sale.purchased_at).toLocaleString() : 'Recent transaction'}
@@ -1083,10 +1264,12 @@ function MainApp() {
                       style={vendorStyles.clearHistoryBtn} 
                       onPress={handleClearSalesHistory}
                     >
-                      <Feather name="trash-2" size={15} color="#DC2626" />
-                      <Text style={vendorStyles.clearHistoryBtnText}>Clear Sales History</Text>
+                      <Feather name="trash-2" size={15} color={STATUS_COLORS.FAILED} />
+                      <Text style={[vendorStyles.clearHistoryBtnText, { color: STATUS_COLORS.FAILED }]}>
+                        Clear Sales History
+                      </Text>
                     </TouchableOpacity>
-                  </>
+                  </View>
                 )}
               </ScrollView>
             )}
@@ -1102,7 +1285,7 @@ function MainApp() {
                   <Text style={vendorStyles.sectionCardTitle}>Kiosk Station Pairing</Text>
                   <View style={vendorStyles.statusItemRow}>
                     <Text style={vendorStyles.statusItemLabel}>Status:</Text>
-                    <Text style={[vendorStyles.statusItemVal, { color: currentUser?.synced_kiosk_code ? '#16A34A' : '#DC2626' }]}>
+                    <Text style={[vendorStyles.statusItemVal, { color: currentUser?.synced_kiosk_code ? STATUS_COLORS.SUCCESS : STATUS_COLORS.FAILED }]}>
                       {currentUser?.synced_kiosk_code ? `Synced to ${currentUser.synced_kiosk_code}` : 'No Kiosk Paired'}
                     </Text>
                   </View>
@@ -1112,8 +1295,8 @@ function MainApp() {
                       style={[vendorStyles.clearHistoryBtn, { marginTop: 10, marginBottom: 4 }]}
                       onPress={handleUnsyncKiosk}
                     >
-                      <Feather name="link-2" size={14} color="#DC2626" />
-                      <Text style={vendorStyles.clearHistoryBtnText}>Unsync from Kiosk</Text>
+                      <Feather name="link-2" size={14} color={STATUS_COLORS.FAILED} />
+                      <Text style={[vendorStyles.clearHistoryBtnText, { color: STATUS_COLORS.FAILED }]}>Unsync from Kiosk</Text>
                     </TouchableOpacity>
                   ) : (
                     <TouchableOpacity
@@ -1138,7 +1321,7 @@ function MainApp() {
                   </View>
                   <View style={[vendorStyles.statusItemRow, { borderBottomWidth: 0 }]}>
                     <Text style={vendorStyles.statusItemLabel}>Operational Status:</Text>
-                    <Text style={[vendorStyles.statusItemVal, { color: '#16A34A' }]}>Active / Online</Text>
+                    <Text style={[vendorStyles.statusItemVal, { color: STATUS_COLORS.SUCCESS }]}>Active / Online</Text>
                   </View>
                 </View>
 
@@ -1156,8 +1339,8 @@ function MainApp() {
                     onPress={handleLogout}
                   >
                     <View style={vendorStyles.profileOptionLeft}>
-                      <Feather name="log-out" size={15} color="#DC2626" />
-                      <Text style={[vendorStyles.profileOptionText, { color: '#DC2626' }]}>Sign Out / Switch Account</Text>
+                      <Feather name="log-out" size={15} color={STATUS_COLORS.FAILED} />
+                      <Text style={[vendorStyles.profileOptionText, { color: STATUS_COLORS.FAILED }]}>Sign Out / Switch Account</Text>
                     </View>
                     <Feather name="chevron-right" size={16} color="#CBD5E1" />
                   </TouchableOpacity>
@@ -1185,7 +1368,7 @@ function MainApp() {
                   <Feather
                     name="home"
                     size={18}
-                    color={vendorNavTab === 'dashboard' ? '#1E5E3A' : '#64748B'}
+                    color={vendorNavTab === 'dashboard' ? STATUS_COLORS.PRIMARY_GREEN : '#64748B'}
                   />
                 </View>
                 <Text style={[vendorStyles.bottomNavLabel, vendorNavTab === 'dashboard' && vendorStyles.bottomNavLabelActive]}>
@@ -1201,7 +1384,7 @@ function MainApp() {
                   <Ionicons
                     name="leaf-outline"
                     size={18}
-                    color={vendorNavTab === 'inventory' ? '#1E5E3A' : '#64748B'}
+                    color={vendorNavTab === 'inventory' ? STATUS_COLORS.PRIMARY_GREEN : '#64748B'}
                   />
                 </View>
                 <Text style={[vendorStyles.bottomNavLabel, vendorNavTab === 'inventory' && vendorStyles.bottomNavLabelActive]}>
@@ -1217,7 +1400,7 @@ function MainApp() {
                   <Feather
                     name="trending-up"
                     size={18}
-                    color={vendorNavTab === 'sales' ? '#1E5E3A' : '#64748B'}
+                    color={vendorNavTab === 'sales' ? STATUS_COLORS.PRIMARY_GREEN : '#64748B'}
                   />
                 </View>
                 <Text style={[vendorStyles.bottomNavLabel, vendorNavTab === 'sales' && vendorStyles.bottomNavLabelActive]}>
@@ -1233,7 +1416,7 @@ function MainApp() {
                   <Feather
                     name="user"
                     size={18}
-                    color={vendorNavTab === 'profile' ? '#1E5E3A' : '#64748B'}
+                    color={vendorNavTab === 'profile' ? STATUS_COLORS.PRIMARY_GREEN : '#64748B'}
                   />
                 </View>
                 <Text style={[vendorStyles.bottomNavLabel, vendorNavTab === 'profile' && vendorStyles.bottomNavLabelActive]}>
@@ -1289,11 +1472,11 @@ function MainApp() {
                           <View style={{ flex: 1 }}>
                             <Text style={{ fontSize: 16, fontWeight: '800', color: '#0F172A' }}>{item.vendor_name || 'Sigla Ani Kiosk'}</Text>
                             <Text style={{ fontSize: 12, color: '#64748B', marginTop: 2 }}>{item.purchased_at ? new Date(item.purchased_at).toLocaleString() : 'Recent Purchase'}</Text>
-                            <Text style={{ fontSize: 11, fontFamily: 'monospace', color: '#1E5E3A', marginTop: 2 }}>{item.transaction_id}</Text>
+                            <Text style={{ fontSize: 11, fontFamily: 'monospace', color: STATUS_COLORS.PRIMARY_GREEN, marginTop: 2 }}>{item.transaction_id}</Text>
                           </View>
                           <View style={{ alignItems: 'flex-end' }}>
-                            <View style={{ backgroundColor: '#D7ECD9', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 }}>
-                              <Text style={{ fontSize: 12, fontWeight: '800', color: '#1E5E3A' }}>₱{item.total_amount || 0}</Text>
+                            <View style={{ backgroundColor: STATUS_COLORS.SUCCESS_BG, paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12 }}>
+                              <Text style={{ fontSize: 12, fontWeight: '800', color: STATUS_COLORS.SUCCESS }}>₱{item.total_amount || 0}</Text>
                             </View>
                             <Text style={{ fontSize: 11, color: '#64748B', marginTop: 6 }}>{isExpanded ? 'Hide ▲' : 'View Fruits ▼'}</Text>
                           </View>
@@ -1317,8 +1500,8 @@ function MainApp() {
                                 <View style={{ flex: 1, marginLeft: 10 }}>
                                   <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                                     <Text style={{ fontSize: 14, fontWeight: '800', color: '#0F172A' }}>{fruit.fruit_type}</Text>
-                                    <View style={{ backgroundColor: isRotten ? '#FEE2E2' : '#DCFCE7', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
-                                      <Text style={{ fontSize: 10, fontWeight: '800', color: isRotten ? '#EF4444' : '#16A34A' }}>{fruit.status}</Text>
+                                    <View style={{ backgroundColor: isRotten ? STATUS_COLORS.FAILED_BG : STATUS_COLORS.SUCCESS_BG, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6 }}>
+                                      <Text style={{ fontSize: 10, fontWeight: '800', color: isRotten ? STATUS_COLORS.FAILED : STATUS_COLORS.SUCCESS }}>{fruit.status}</Text>
                                     </View>
                                   </View>
                                   <Text style={{ fontSize: 11, color: '#64748B', marginTop: 2 }}>⏳ {shelfLife.statusText}</Text>
@@ -1354,8 +1537,8 @@ function MainApp() {
                         <View style={{ padding: 4 }}>
                           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
                             <Text style={{ fontSize: 16, fontWeight: '800', color: '#0F172A' }}>{item.fruit_type || item.fruit}</Text>
-                            <View style={{ backgroundColor: isRotten ? '#FEE2E2' : '#DCFCE7', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
-                              <Text style={{ fontSize: 11, fontWeight: '800', color: isRotten ? '#EF4444' : '#16A34A' }}>{item.status}</Text>
+                            <View style={{ backgroundColor: isRotten ? STATUS_COLORS.FAILED_BG : STATUS_COLORS.SUCCESS_BG, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 }}>
+                              <Text style={{ fontSize: 11, fontWeight: '800', color: isRotten ? STATUS_COLORS.FAILED : STATUS_COLORS.SUCCESS }}>{item.status}</Text>
                             </View>
                           </View>
                           <Text style={{ fontSize: 12, fontStyle: 'italic', color: '#64748B', marginTop: 2 }}>{item.scientific || 'SIGLA ANI AI'}</Text>
@@ -1376,7 +1559,7 @@ function MainApp() {
           </ScrollView>
 
           <TouchableOpacity
-            style={{ position: 'absolute', bottom: 20, right: 20, backgroundColor: '#1E5E3A', width: 60, height: 60, borderRadius: 30, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.3, shadowRadius: 4 }}
+            style={{ position: 'absolute', bottom: 20, right: 20, backgroundColor: STATUS_COLORS.PRIMARY_GREEN, width: 60, height: 60, borderRadius: 30, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.3, shadowRadius: 4 }}
             onPress={() => setConsumerScreen(prev => (prev === 'scanner' ? 'basket' : 'scanner'))}
           >
             <Feather name="camera" size={24} color="#FFFFFF" />
@@ -1453,8 +1636,8 @@ function MainApp() {
               style={vendorStyles.clearHistoryBtn} 
               onPress={handleClearFruitStockHistory}
             >
-              <Feather name="trash-2" size={15} color="#DC2626" />
-              <Text style={vendorStyles.clearHistoryBtnText}>Clear Stock Logs</Text>
+              <Feather name="trash-2" size={15} color={STATUS_COLORS.FAILED} />
+              <Text style={[vendorStyles.clearHistoryBtnText, { color: STATUS_COLORS.FAILED }]}>Clear Stock Logs</Text>
             </TouchableOpacity>
 
             <TouchableOpacity 
@@ -1570,3 +1753,35 @@ function MainApp() {
     </SafeAreaView>
   );
 }
+
+const inlineStyles = StyleSheet.create({
+  archiveSwitchWrap: {
+    flexDirection: 'row',
+    backgroundColor: '#E2E8F0',
+    borderRadius: 8,
+    padding: 3,
+    marginBottom: 10,
+  },
+  archiveSwitchBtn: {
+    flex: 1,
+    paddingVertical: 7,
+    alignItems: 'center',
+    borderRadius: 6,
+  },
+  archiveSwitchBtnActive: {
+    backgroundColor: '#FFFFFF',
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+  },
+  archiveSwitchText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  archiveSwitchTextActive: {
+    color: STATUS_COLORS.PRIMARY_GREEN,
+    fontWeight: '800',
+  },
+});
