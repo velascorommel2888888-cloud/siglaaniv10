@@ -24,7 +24,7 @@ XAI_MAX_COVERAGE   = 0.85
 
 CLOUD_SYNC_URL = os.environ.get("SIGLAANI_CLOUD_URL", "")
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="build/static", static_url_path="/static")
 CORS(app)
 
 @app.after_request
@@ -77,18 +77,23 @@ RECOMMENDATIONS = {
 
 FRUIT_METADATA = {
     "banana":     ("Banana",     "Musa acuminata"),
+    "saging":     ("Banana",     "Musa acuminata"),
     "apple":      ("Apple",      "Malus domestica"),
+    "mansanas":   ("Apple",      "Malus domestica"),
     "orange":     ("Orange",     "Citrus sinensis"),
+    "dalandan":   ("Orange",     "Citrus sinensis"),
     "mango":      ("Mango",      "Mangifera indica"),
+    "mangga":     ("Mango",      "Mangifera indica"),
     "strawberry": ("Strawberry", "Fragaria × ananassa"),
 }
 
-def parse_model_label(raw_label: str):
+def parse_model_label(raw_label: str, raw_confidence: float = 85.0):
     lbl = str(raw_label or "").strip().lower()
-    if not lbl or "background" in lbl or "empty" in lbl:
-        return None, None, None, True
+    
+    if not lbl or "background" in lbl or "empty" in lbl or "person" in lbl or "face" in lbl or "human" in lbl:
+        return None, None, None, True, 0.0, 0.0
 
-    fruit_name = "Fruit"
+    fruit_name = None
     sci_name = "SIGLA ANI AI"
     for key, (display_name, scientific) in FRUIT_METADATA.items():
         if key in lbl:
@@ -96,18 +101,24 @@ def parse_model_label(raw_label: str):
             sci_name = scientific
             break
 
-    if "overripe" in lbl:
+    if not fruit_name or raw_confidence < 40.0:
+        return None, None, None, True, 0.0, 0.0
+
+    if "rotten" in lbl or "bulok" in lbl or "spoiled" in lbl:
+        condition = "rotten"
+    elif "overripe" in lbl:
         condition = "overripe"
     elif "unripe" in lbl:
         condition = "unripe"
-    elif "rotten" in lbl:
-        condition = "rotten"
     elif "ripe" in lbl or "fresh" in lbl:
         condition = "ripe"
     else:
         condition = "ripe"
 
-    return fruit_name, sci_name, condition, False
+    fruit_conf = round(float(raw_confidence), 1)
+    ripeness_conf = round(max(50.0, min(99.0, float(raw_confidence) - 3.0)), 1)
+
+    return fruit_name, sci_name, condition, False, fruit_conf, ripeness_conf
 
 def condition_to_rating(condition: str, confidence: int) -> int:
     if condition == "ripe":
@@ -123,26 +134,28 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scans (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            fruit            TEXT    NOT NULL DEFAULT 'Unknown',
-            scientific       TEXT    DEFAULT '',
-            condition        TEXT    NOT NULL DEFAULT 'ripe',
-            condition_label  TEXT    DEFAULT '',
-            confidence       REAL    DEFAULT 0,
-            rating           INTEGER DEFAULT 3,
-            recommendation   TEXT    DEFAULT '',
-            temp             REAL    DEFAULT 0,
-            thumbnail        TEXT    DEFAULT '',
-            scanned_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            capture_filename TEXT   DEFAULT '',
-            xai_filename     TEXT   DEFAULT '',
-            xai_coverage     REAL   DEFAULT 0,
-            xai_explanation  TEXT   DEFAULT '',
-            xai_generated    INTEGER DEFAULT 0,
-            transaction_id   TEXT    DEFAULT NULL,
-            is_purchased     INTEGER DEFAULT 0,
-            synced           INTEGER DEFAULT 0,
-            is_archived      INTEGER DEFAULT 0
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            fruit               TEXT    NOT NULL DEFAULT 'Unknown',
+            scientific          TEXT    DEFAULT '',
+            condition           TEXT    NOT NULL DEFAULT 'ripe',
+            condition_label     TEXT    DEFAULT '',
+            confidence          REAL    DEFAULT 0,
+            fruit_confidence    REAL    DEFAULT 0,
+            ripeness_confidence REAL    DEFAULT 0,
+            rating              INTEGER DEFAULT 3,
+            recommendation      TEXT    DEFAULT '',
+            temp                REAL    DEFAULT 0,
+            thumbnail           TEXT    DEFAULT '',
+            scanned_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            capture_filename    TEXT   DEFAULT '',
+            xai_filename        TEXT   DEFAULT '',
+            xai_coverage        REAL   DEFAULT 0,
+            xai_explanation     TEXT   DEFAULT '',
+            xai_generated       INTEGER DEFAULT 0,
+            transaction_id      TEXT    DEFAULT NULL,
+            is_purchased        INTEGER DEFAULT 0,
+            synced              INTEGER DEFAULT 0,
+            is_archived         INTEGER DEFAULT 0
         )
     """)
     conn.execute("""
@@ -202,6 +215,8 @@ def init_db():
         ("inventory", "vendor_id", "INTEGER DEFAULT NULL"),
         ("inventory", "is_archived", "INTEGER DEFAULT 0"),
         ("scans", "is_archived", "INTEGER DEFAULT 0"),
+        ("scans", "fruit_confidence", "REAL DEFAULT 0"),
+        ("scans", "ripeness_confidence", "REAL DEFAULT 0"),
         ("transactions", "vendor_id", "INTEGER DEFAULT NULL"),
         ("transactions", "is_archived", "INTEGER DEFAULT 0"),
         ("users", "phone_number", "TEXT DEFAULT ''"),
@@ -222,27 +237,29 @@ def save_scan(data: dict) -> int:
         cur.execute("""
             INSERT INTO scans
               (fruit, scientific, condition, condition_label,
-               confidence, rating, recommendation, temp, thumbnail,
+               confidence, fruit_confidence, ripeness_confidence, rating, recommendation, temp, thumbnail,
                capture_filename, xai_filename, xai_coverage,
                xai_explanation, xai_generated, transaction_id, is_purchased, synced, is_archived)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)
         """, (
-            str(data.get("fruit",            "Unknown")),
-            str(data.get("scientific",       "SIGLA ANI AI")),
-            str(data.get("condition",        "ripe")),
-            str(data.get("conditionLabel",   "Hinog (Ripe)")),
-            float(data.get("confidence",     0)),
-            int(data.get("rating",           3)),
-            str(data.get("recommendation",   "")),
-            float(data.get("temp",           0)),
-            str(data.get("thumbnail",        "")),
-            str(data.get("capture_filename", "")),
-            str(data.get("xai_filename",     "")),
-            float(data.get("xai_coverage",   0)),
-            str(data.get("xai_explanation",  "")),
-            int(data.get("xai_generated",    0)),
-            data.get("transaction_id",       None),
-            int(data.get("is_purchased",     0)),
+            str(data.get("fruit",               "Unknown")),
+            str(data.get("scientific",          "SIGLA ANI AI")),
+            str(data.get("condition",           "ripe")),
+            str(data.get("conditionLabel",      "Hinog (Ripe)")),
+            float(data.get("confidence",        0)),
+            float(data.get("fruit_confidence",   0)),
+            float(data.get("ripeness_confidence",0)),
+            int(data.get("rating",              3)),
+            str(data.get("recommendation",      "")),
+            float(data.get("temp",              0)),
+            str(data.get("thumbnail",           "")),
+            str(data.get("capture_filename",    "")),
+            str(data.get("xai_filename",        "")),
+            float(data.get("xai_coverage",      0)),
+            str(data.get("xai_explanation",     "")),
+            int(data.get("xai_generated",       0)),
+            data.get("transaction_id",          None),
+            int(data.get("is_purchased",        0)),
         ))
         conn.commit()
         return cur.lastrowid
@@ -618,7 +635,6 @@ def add_fruit_inventory():
     try:
         cur = conn.cursor()
         
-        # Explicit existence check: avoids SQLite ON CONFLICT index requirements
         if vendor_id:
             existing = cur.execute(
                 "SELECT id FROM inventory WHERE LOWER(fruit_type) = LOWER(?) AND (vendor_id = ? OR vendor_id IS NULL)",
@@ -747,7 +763,6 @@ def restore_fruit_inventory(fruit_type):
     finally:
         conn.close()
 
-# ── Permanent Hard Delete Endpoint ───────────────────────────────────────────
 @app.route("/api/inventory/<string:fruit_type>/permanent", methods=["DELETE"])
 def permanent_delete_fruit_inventory(fruit_type):
     vendor_id = request.args.get("vendor_id")
@@ -818,16 +833,19 @@ def history():
     limit = int(request.args.get("limit", 50))
     view_archived = request.args.get("archived", "0") == "1"
 
-    if not kiosk_code:
-        return jsonify([]), 200
+    if kiosk_code:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        try:
+            kiosk = conn.execute("SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)).fetchone()
+            if not kiosk or not kiosk["synced_vendor_id"]:
+                return jsonify([]), 200
+        finally:
+            conn.close()
 
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
-        kiosk = conn.execute("SELECT synced_vendor_id FROM kiosks WHERE kiosk_code = ?", (kiosk_code,)).fetchone()
-        if not kiosk or not kiosk["synced_vendor_id"]:
-            return jsonify([]), 200
-
         where = "WHERE is_archived = 0" if not view_archived else "WHERE is_archived = 1"
         rows = conn.execute(f"SELECT * FROM scans {where} ORDER BY scanned_at DESC LIMIT ?", (limit,)).fetchall()
         return jsonify([dict(r) for r in rows]), 200
@@ -885,7 +903,9 @@ def scan():
         cur = conn.cursor()
         for idx, item in enumerate(fruits_list):
             raw_label = str(item.get("detected_fruit") or "").strip()
-            fruit_display, sci, parsed_condition, is_bg = parse_model_label(raw_label)
+            raw_conf = float(item.get("model_confidence") or 85)
+
+            fruit_display, sci, parsed_condition, is_bg, fruit_conf, ripeness_conf = parse_model_label(raw_label, raw_conf)
 
             if is_bg:
                 continue
@@ -893,32 +913,43 @@ def scan():
             passed_condition = str(item.get("model_condition") or "").strip().lower()
             condition = passed_condition if passed_condition in CONDITION_LABELS else parsed_condition
 
-            confidence = int(item.get("model_confidence") or 85)
             bbox = item.get("bbox")
-
             crop, _ = get_analysis_region(frame, bbox)
             crop_filename = save_crop_image(crop, prefix=f"crop_{fruit_display.lower()}_{idx+1}")
 
             inv = cur.execute("SELECT price_per_kg, unit_price FROM inventory WHERE LOWER(fruit_type) = LOWER(?) AND is_archived = 0", (fruit_display,)).fetchone()
             price_per_kg = inv["price_per_kg"] if inv and "price_per_kg" in inv.keys() else (inv["unit_price"] if inv else 100.0)
 
+            plaintext_qr_payload = (
+                f"SIGLA ANI INSPECTION REPORT\n"
+                f"Prutas: {fruit_display}\n"
+                f"Kondisyon: {CONDITION_LABELS.get(condition, 'Hinog (Ripe)')}\n"
+                f"Fruit Confidence: {fruit_conf}%\n"
+                f"Ripeness Confidence: {ripeness_conf}%\n"
+                f"Rekomendasyon: {RECOMMENDATIONS.get(condition, RECOMMENDATIONS['ripe'])}\n"
+                f"Petsa: {datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+            )
+
             result_item = {
-                "fruit":            fruit_display,
-                "scientific":       sci,
-                "condition":        condition,
-                "conditionLabel":   CONDITION_LABELS.get(condition, "Hinog (Ripe)"),
-                "confidence":       confidence,
-                "rating":           condition_to_rating(condition, confidence),
-                "recommendation":   RECOMMENDATIONS.get(condition, RECOMMENDATIONS["ripe"]),
-                "temp":             0.0,
-                "price_per_kg":     price_per_kg,
-                "thumbnail":        make_thumbnail(crop),
-                "capture_filename": crop_filename,
-                "image_url":        f"/captures/{crop_filename}",
-                "full_image_url":   f"/captures/{full_capture_filename}",
-                "transaction_id":   transaction_id,
-                "is_purchased":     0,
-                "xai":              {"available": False}
+                "fruit":               fruit_display,
+                "scientific":          sci,
+                "condition":           condition,
+                "conditionLabel":      CONDITION_LABELS.get(condition, "Hinog (Ripe)"),
+                "confidence":          ripeness_conf,
+                "fruit_confidence":    fruit_conf,
+                "ripeness_confidence": ripeness_conf,
+                "rating":              condition_to_rating(condition, int(ripeness_conf)),
+                "recommendation":      RECOMMENDATIONS.get(condition, RECOMMENDATIONS["ripe"]),
+                "temp":                0.0,
+                "price_per_kg":        price_per_kg,
+                "thumbnail":           make_thumbnail(crop),
+                "capture_filename":    crop_filename,
+                "image_url":           f"/captures/{crop_filename}",
+                "full_image_url":      f"/captures/{full_capture_filename}",
+                "qr_plaintext":        plaintext_qr_payload,
+                "transaction_id":      transaction_id,
+                "is_purchased":        0,
+                "xai":                 {"available": False}
             }
 
             new_id = save_scan(result_item)
@@ -1007,14 +1038,14 @@ def checkout():
                 total_items_count += qty
                 for _ in range(qty):
                     cur.execute("""
-                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
-                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
+                        INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, fruit_confidence, ripeness_confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
+                        VALUES (?, 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 92, 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
                     """, (f_type, transaction_id))
         else:
             total_items_count = 1
             cur.execute("""
-                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
-                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
+                INSERT INTO scans (fruit, scientific, condition, condition_label, confidence, fruit_confidence, ripeness_confidence, rating, recommendation, transaction_id, is_purchased, synced, is_archived)
+                VALUES ('Fruit', 'SIGLA ANI AI', 'ripe', 'Hinog (Ripe)', 90, 92, 90, 4, 'Napakasariwa at angkop kainin.', ?, 1, 0, 0)
             """, (transaction_id,))
 
         cur.execute("""
@@ -1036,7 +1067,7 @@ def checkout():
     finally:
         conn.close()
 
-# ── Static File Serving & Receipts ───────────────────────────────────────────
+# ── Static File Serving & React Build SPA Routing ─────────────────────────────
 @app.route("/captures/<path:filename>")
 def serve_capture(filename):
     return send_from_directory(CAPTURE_DIR, filename)
@@ -1044,6 +1075,24 @@ def serve_capture(filename):
 @app.route("/xai_overlays/<path:filename>")
 def serve_xai(filename):
     return send_from_directory(XAI_DIR, filename)
+
+@app.route("/")
+def serve_index():
+    build_dir = os.path.join(BASE_DIR, "build")
+    index_path = os.path.join(build_dir, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(build_dir, "index.html")
+    return jsonify({"error": "Build folder not found. Run 'npm run build'."}), 404
+
+@app.route("/<path:path>")
+def serve_spa(path):
+    build_dir = os.path.join(BASE_DIR, "build")
+    target_path = os.path.join(build_dir, path)
+    
+    if os.path.exists(target_path) and os.path.isfile(target_path):
+        return send_from_directory(build_dir, path)
+    
+    return send_from_directory(build_dir, "index.html")
 
 @app.route("/api/receipt/<string:transaction_id>", methods=["GET"])
 def get_receipt(transaction_id):
@@ -1060,14 +1109,16 @@ def get_receipt(transaction_id):
             row = dict(s)
             filename = row.get("capture_filename") or ""
             items.append({
-                "scan_id":        row["id"],
-                "fruit_type":     row["fruit"],
-                "scientific":     row["scientific"],
-                "status":         row["condition_label"] or CONDITION_LABELS.get(row["condition"], row["condition"]),
-                "confidence":     row["confidence"],
-                "rating":         row["rating"],
-                "recommendation": row["recommendation"],
-                "image_url":      f"/captures/{os.path.basename(filename)}" if filename else None
+                "scan_id":             row["id"],
+                "fruit_type":          row["fruit"],
+                "scientific":          row["scientific"],
+                "status":              row["condition_label"] or CONDITION_LABELS.get(row["condition"], row["condition"]),
+                "confidence":          row["confidence"],
+                "fruit_confidence":    row.get("fruit_confidence", row["confidence"]),
+                "ripeness_confidence": row.get("ripeness_confidence", row["confidence"]),
+                "rating":              row["rating"],
+                "recommendation":      row["recommendation"],
+                "image_url":           f"/captures/{os.path.basename(filename)}" if filename else None
             })
         receipt_data = dict(txn)
         receipt_data["items"] = items
@@ -1086,16 +1137,18 @@ def get_scan_by_id(scan_id):
         data = dict(row)
         filename = data.get("capture_filename") or ""
         return jsonify({
-            "scan_id":        data["id"],
-            "fruit_type":     data["fruit"],
-            "scientific":     data["scientific"],
-            "status":         data["condition_label"] or CONDITION_LABELS.get(data["condition"], data["condition"]),
-            "confidence":     data["confidence"],
-            "rating":         data["rating"],
-            "recommendation": data["recommendation"],
-            "timestamp":      data["scanned_at"],
-            "image_url":      f"/captures/{os.path.basename(filename)}" if filename else None,
-            "transaction_id": data.get("transaction_id")
+            "scan_id":             data["id"],
+            "fruit_type":          data["fruit"],
+            "scientific":          data["scientific"],
+            "status":              data["condition_label"] or CONDITION_LABELS.get(data["condition"], data["condition"]),
+            "confidence":          data["confidence"],
+            "fruit_confidence":    data.get("fruit_confidence", data["confidence"]),
+            "ripeness_confidence": data.get("ripeness_confidence", data["confidence"]),
+            "rating":              data["rating"],
+            "recommendation":      data["recommendation"],
+            "timestamp":           data["scanned_at"],
+            "image_url":           f"/captures/{os.path.basename(filename)}" if filename else None,
+            "transaction_id":      data.get("transaction_id")
         }), 200
     finally:
         conn.close()
